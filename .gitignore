@@ -3,3 +3,4 @@ __pycache__/
 .git/
 node_modules/
 *.pyc
+summary-prompt-openclaw.md
