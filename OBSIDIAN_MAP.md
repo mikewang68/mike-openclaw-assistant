@@ -1,0 +1,55 @@
+/obsidian
+/obsidian/00_Auxiliary
+/obsidian/00_Auxiliary/01_Template
+/obsidian/00_Auxiliary/02_Tag
+/obsidian/00_Auxiliary/03_Prompt
+/obsidian/00_Auxiliary/04_ShortCut
+/obsidian/00_Auxiliary/05_BaseInfo
+/obsidian/01_Input
+/obsidian/01_Input/01_视频
+/obsidian/01_Input/02_网站
+/obsidian/01_Input/03_音频
+/obsidian/01_Input/04_PDF
+/obsidian/01_Input/05_FromAI
+/obsidian/02_Output
+/obsidian/02_Output/00_概念
+/obsidian/02_Output/01_技术
+/obsidian/02_Output/02_编程
+/obsidian/02_Output/03_框架
+/obsidian/02_Output/04_论文
+/obsidian/02_Output/05_可创新
+/obsidian/02_Output/06_金融
+/obsidian/02_Output/06_金融/00 交易系统
+/obsidian/02_Output/06_金融/01 技术指标
+/obsidian/02_Output/06_金融/02 中国A股
+/obsidian/02_Output/06_金融/03 加密货币
+/obsidian/03_Project
+/obsidian/03_Project/01_跨境支付
+/obsidian/03_Project/02_水产冷链
+/obsidian/03_Project/03_军工大数据
+/obsidian/03_Project/08_openclaw
+/obsidian/03_Project/09_n8n
+/obsidian/04_Outcome
+/obsidian/04_Outcome/01_教学
+/obsidian/04_Outcome/01_教学/01_大数据处理技术（研究生）
+/obsidian/04_Outcome/01_教学/02_轨道交通大数据（研究生）
+/obsidian/04_Outcome/01_教学/03_区块链技术应用（研究生）
+/obsidian/04_Outcome/01_教学/04_大数据导论（本科生）
+/obsidian/04_Outcome/01_教学/05_智慧交通大数据实训（本科生）
+/obsidian/04_Outcome/01_教学/06_操作系统（本科生）
+/obsidian/04_Outcome/01_教学/07_大语言模型基础及应用
+/obsidian/04_Outcome/01_教学/99_毕业设计
+/obsidian/04_Outcome/02_科研
+/obsidian/97_Meeting
+/obsidian/98_灵感
+/obsidian/99_日记
+/obsidian/Clippings
+/obsidian/Excalidraw
+/obsidian/attachments
+/obsidian/audio
+/obsidian/copilot
+/obsidian/copilot-conversations
+/obsidian/copilot-custom-prompts
+/obsidian/copilot/copilot-conversations
+/obsidian/copilot/copilot-custom-prompts
+/obsidian/temp_chunks
