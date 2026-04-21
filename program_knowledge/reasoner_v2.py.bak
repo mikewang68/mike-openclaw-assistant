@@ -1,0 +1,442 @@
+"""
+Reasoner v2 — 推理引擎升级版
+基于 Opus 4.6 设计方案
+
+核心能力：
+- 可扩展规则表（Composition Table）
+- 置信度链式衰减传播
+- 三级冲突检测与解决
+- 双写 MongoDB + Neo4j
+"""
+
+import sys
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(__file__))
+from mongo_writer import MongoWriter, InferredTriple, ConflictRecord
+from neo4j_writer import Neo4jWriter
+from config import MAX_INFERRED, REASONER_HOPS, REASONER_MIN_CONF
+from neo4j_writer import NEO4J_AVAILABLE
+
+
+# ============================================================
+# 规则组合表（可配置，扩展只需添加新条目）
+# ============================================================
+@dataclass
+class ComposedRelation:
+    relation: str       # 推理出的关系类型
+    decay: float       # 衰减系数
+    tag: str          # transitive / cross
+    min_confidence: float = 0.5
+    max_hops: int = 3
+
+
+COMPOSITION_TABLE = {
+    # === 传递性规则 ===
+    ("USES", "USES"): ComposedRelation("USES", decay=0.80, tag="transitive"),
+    ("BASED_ON", "BASED_ON"): ComposedRelation("BASED_ON", decay=0.75, tag="transitive"),
+    ("IMPROVES", "IMPROVES"): ComposedRelation("IMPROVES", decay=0.70, tag="transitive"),
+
+    # === 跨关系组合 ===
+    ("USES", "IMPROVES"): ComposedRelation("IMPROVES", decay=0.70, tag="cross"),
+    ("USES", "ENABLES"): ComposedRelation("ENABLES", decay=0.60, tag="cross"),
+    ("USES", "OUTPERFORMS"): ComposedRelation("OUTPERFORMS", decay=0.65, tag="cross"),
+    ("USES", "APPLIES_TO"): ComposedRelation("APPLIES_TO", decay=0.65, tag="cross"),
+    ("PROPOSES", "OUTPERFORMS"): ComposedRelation("OUTPERFORMS", decay=0.85, tag="cross"),
+    ("PROPOSES", "USES"): ComposedRelation("USES", decay=0.90, tag="cross"),
+    ("PROPOSES", "APPLIES_TO"): ComposedRelation("APPLIES_TO", decay=0.90, tag="cross"),
+    ("PROPOSES", "ENABLES"): ComposedRelation("ENABLES", decay=0.85, tag="cross"),
+    ("BASED_ON", "USES"): ComposedRelation("USES", decay=0.65, tag="cross"),
+    ("BASED_ON", "ENABLES"): ComposedRelation("ENABLES", decay=0.60, tag="cross"),
+    ("REPLACES", "APPLIES_TO"): ComposedRelation("APPLIES_TO", decay=0.70, tag="cross"),
+    ("IMPROVES", "APPLIES_TO"): ComposedRelation("APPLIES_TO", decay=0.75, tag="cross"),
+    ("ENABLES", "USES"): ComposedRelation("ENABLES", decay=0.60, tag="cross"),
+    ("ENABLES", "APPLIES_TO"): ComposedRelation("APPLIES_TO", decay=0.70, tag="cross"),
+    ("INTRODUCES", "IMPROVES"): ComposedRelation("IMPROVES", decay=0.80, tag="cross"),
+    ("INTRODUCES", "USES"): ComposedRelation("USES", decay=0.85, tag="cross"),
+    ("INTRODUCES", "ENABLES"): ComposedRelation("ENABLES", decay=0.75, tag="cross"),
+    ("REPLACES", "USES"): ComposedRelation("USES", decay=0.75, tag="cross"),
+    
+    # === 新增：量化交易与科研逻辑增强 ===
+    ("REQUIRES", "ENABLES"): ComposedRelation("ENABLES", decay=0.80, tag="cross"),
+    ("REQUIRES", "USES"): ComposedRelation("USES", decay=0.80, tag="cross"),
+    ("ENABLES", "BASED_ON"): ComposedRelation("BASED_ON", decay=0.70, tag="cross"),
+    ("BASED_ON", "IMPROVES"): ComposedRelation("IMPROVES", decay=0.70, tag="cross"),
+    ("USES", "BASED_ON"): ComposedRelation("BASED_ON", decay=0.75, tag="cross"),
+}
+
+
+# ============================================================
+# 冲突关系对
+# ============================================================
+CONFLICT_PAIRS = [
+    ("IMPROVES", "DEGRADES"),
+    ("OUTPERFORMS", "UNDERPERFORMS"),
+    ("ENABLES", "PREVENTS"),
+    ("REPLACES", "REQUIRES"),
+]
+
+
+# ============================================================
+# 置信度计算
+# ============================================================
+def compute_chain_confidence(
+    path_confidences: list[float],
+    rule_decay: float,
+    hop_count: int
+) -> float:
+    """
+    计算推理链的最终置信度
+
+    conf = conf(A→B) × conf(B→C) × ... × decay × length_penalty
+    """
+    if not path_confidences:
+        return 0.0
+
+    # 链式乘积
+    conf = path_confidences[0]
+    for c in path_confidences[1:]:
+        conf *= c
+
+    # 规则衰减
+    conf *= rule_decay
+
+    # 长度惩罚（每多一跳 ×0.95）
+    if hop_count > 0:
+        conf *= (0.95 ** (hop_count - 1))
+
+    return round(min(conf, 1.0), 4)
+
+
+def merge_multi_path(confidences: list[float]) -> float:
+    """
+    多路径汇聚：取最大值 + 增强
+    """
+    if not confidences:
+        return 0.0
+
+    base = max(confidences)
+    n = len(confidences)
+    # boost：多条独立路径互相印证
+    boost = min(0.1 * (n - 1), 0.15)
+    return round(min(base * (1 + boost), 1.0), 4)
+
+
+# ============================================================
+# 冲突检测
+# ============================================================
+def detect_conflicts(triples: list[dict]) -> list[tuple]:
+    """
+    检测冲突三元组对
+    返回：(triple_a, triple_b, conflict_type)
+    """
+    conflicts = []
+
+    # 按 (subject, object) 建索引
+    index = defaultdict(list)
+    for t in triples:
+        key = (t["subject"], t["object"])
+        index[key].append(t)
+
+    for (s, o), group in index.items():
+        relations = {t["relation"] for t in group}
+        for r1, r2 in CONFLICT_PAIRS:
+            if r1 in relations and r2 in relations:
+                t1 = next(t for t in group if t["relation"] == r1)
+                t2 = next(t for t in group if t["relation"] == r2)
+                conflicts.append((t1, t2, "direct"))
+
+    return conflicts
+
+
+def resolve_conflict_level1(t1: dict, t2: dict) -> Optional[dict]:
+    """
+    Level 1：自动解决
+    - 置信度差 > 0.2，保留高的
+    - 推理深度差 > 1，保留浅的
+    """
+    conf_diff = abs(t1.get("confidence", 0) - t2.get("confidence", 0))
+
+    if conf_diff > 0.2:
+        winner = t1 if t1.get("confidence", 0) > t2.get("confidence", 0) else t2
+        return {
+            "level": 1,
+            "resolved": True,
+            "winner": "A" if winner is t1 else "B",
+            "explanation": f"自动：置信度高者胜（Δconf={conf_diff:.3f})"
+        }
+
+    hop1 = t1.get("inference_metadata", {}).get("hop_count", 0)
+    hop2 = t2.get("inference_metadata", {}).get("hop_count", 0)
+    hop_diff = abs(hop1 - hop2)
+
+    if hop_diff > 1:
+        winner = t1 if hop1 < hop2 else t2
+        return {
+            "level": 1,
+            "resolved": True,
+            "winner": "A" if winner is t1 else "B",
+            "explanation": f"自动：推理深度浅者胜（hops={hop1 if winner is t1 else hop2}）"
+        }
+
+    return None  # 无法自动解决
+
+
+# ============================================================
+# 核心推理引擎
+# ============================================================
+@dataclass
+class InferenceResult:
+    """推理结果"""
+    subject: str
+    relation: str
+    object: str
+    confidence: float
+    hop_count: int = 0
+    provenance: list = field(default_factory=list)
+    rule_tag: str = ""
+    alternative_paths: int = 1
+
+    def to_dict(self) -> dict:
+        return {
+            "subject": self.subject,
+            "relation": self.relation,
+            "object": self.object,
+            "confidence": self.confidence,
+            "hop_count": self.hop_count,
+            "provenance": self.provenance,
+            "rule_tag": self.rule_tag,
+            "alternative_paths": self.alternative_paths,
+        }
+
+
+def forward_chain(
+    facts: list[dict],
+    composition_table: dict = COMPOSITION_TABLE,
+    max_hops: int = REASONER_HOPS,
+    min_confidence: float = 0.5,
+) -> list[InferenceResult]:
+    """
+    BFS 前向链式推理
+
+    Args:
+        facts: 原始三元组列表
+        composition_table: 规则组合表
+        max_hops: 最大推理深度
+        min_confidence: 最低置信度阈值
+
+    Returns:
+        推理结果列表
+    """
+    # 按 subject 建索引
+    by_subject = defaultdict(list)
+    for t in facts:
+        by_subject[t["subject"]].append(t)
+
+    inferred = {}  # (s, rel, o) -> InferenceResult
+    # 队列元素：(triple_dict, current_hop, path_subjects_set)
+    # path_subjects_set 追踪当前推理链上已访问的 subject，防止多跳环
+    queue = []
+
+    # 初始化：所有原始三元组入队
+    for t in facts:
+        queue.append((t, 0, {t["subject"]}))
+
+    while queue:
+        current, hop, path_subjects = queue.pop(0)
+        if hop >= max_hops:
+            continue
+
+        next_triples = by_subject.get(current["object"], [])
+        for next_t in next_triples:
+            # ── Bug #3 修复：路径级循环检测 ──
+            # 如果 next_t 的 subject 已在路径中出现过，说明形成环，跳过
+            if next_t["subject"] in path_subjects:
+                continue
+
+            rule_key = (current["relation"], next_t["relation"])
+            rule = composition_table.get(rule_key)
+            if not rule:
+                continue
+            if hop + 1 > rule.max_hops:
+                continue
+
+            # 计算新置信度
+            path_confs = [current.get("confidence", 0.9), next_t.get("confidence", 0.9)]
+            new_conf = compute_chain_confidence(path_confs, rule.decay, hop + 1)
+
+            if new_conf < min_confidence:
+                continue
+
+            key = (current["subject"], rule.relation, next_t["object"])
+
+            # 多路径汇聚
+            if key in inferred:
+                existing = inferred[key]
+                new_conf = merge_multi_path([existing.confidence, new_conf])
+                existing.confidence = new_conf
+                existing.alternative_paths += 1
+                existing.provenance.append({"triple": next_t, "hop": hop + 1})
+            else:
+                result = InferenceResult(
+                    subject=current["subject"],
+                    relation=rule.relation,
+                    object=next_t["object"],
+                    confidence=new_conf,
+                    hop_count=hop + 1,
+                    provenance=[
+                        {"triple": current, "hop": hop},
+                        {"triple": next_t, "hop": hop + 1}
+                    ],
+                    rule_tag=rule.tag,
+                    alternative_paths=1,
+                )
+                inferred[key] = result
+                # 扩展路径subject集合，传入下一层
+                new_path = path_subjects | {next_t["subject"]}
+                queue.append((result.to_dict(), hop + 1, new_path))
+
+    # 按置信度排序
+    results = list(inferred.values())
+    results.sort(key=lambda x: x.confidence, reverse=True)
+    return results[:MAX_INFERRED]
+
+
+# ============================================================
+# 主推理流程
+# ============================================================
+class ReasonerV2:
+    def __init__(self, llm_client=None):
+        """
+        Args:
+            llm_client: 可选，LLM 客户端（用于 Level 2 冲突裁决）
+        """
+        self.llm_client = llm_client
+        self.mongo = MongoWriter()
+        if NEO4J_AVAILABLE:
+            self.neo4j = Neo4jWriter()
+        else:
+            self.neo4j = None
+
+    def run(self) -> list:
+        """
+        执行完整推理流程
+        """
+        print("Reasoner v2: 启动")
+
+        # 1. 读取所有 raw triples
+        facts = self.mongo.get_all_triples()
+        print(f"  加载 {len(facts)} 条 raw triples")
+        if not facts:
+            print("  ⚠️ 无 triples，跳过推理")
+            return []
+
+        # 2. BFS 前向推理
+        print("  执行前向链式推理...")
+        inferred_results = forward_chain(facts, max_hops=REASONER_HOPS, min_confidence=REASONER_MIN_CONF)
+        print(f"  生成 {len(inferred_results)} 条推理结果")
+
+        if not inferred_results:
+            return []
+
+        # 3. 冲突检测
+        print("  检测冲突...")
+        inferred_dicts = [r.to_dict() for r in inferred_results]
+        conflicts = detect_conflicts(inferred_dicts)
+        print(f"  发现 {len(conflicts)} 对冲突")
+
+        # 4. 冲突解决
+        # Bug #2 修复：resolved_results 真正控制哪些结果写入
+        resolved_results = []
+        conflict_records = []
+        pending_resolution = []  # Level 2/3 未解决的冲突三元组
+
+        for t1, t2, conflict_type in conflicts:
+            # Level 1 自动解决
+            resolution = resolve_conflict_level1(t1, t2)
+            if resolution:
+                conflict_records.append({
+                    "t1": t1, "t2": t2,
+                    "conflict_type": conflict_type,
+                    "resolution": resolution
+                })
+                # 保留胜者
+                winner = t1 if resolution["winner"] == "A" else t2
+                resolved_results.append(winner)
+            else:
+                # Level 2 & 3：标记待处理，不加入 resolved_results
+                t1_marked = {**t1, "pending_resolution": True}
+                t2_marked = {**t2, "pending_resolution": True}
+                pending_resolution.extend([t1_marked, t2_marked])
+
+        # resolved_results + pending_resolution = 全部待写入结果
+        all_to_write = resolved_results + pending_resolution
+        # 用 dict 去重（按 subject+relation+object）
+        seen = {}
+        for item in all_to_write:
+            key = (item["subject"], item["relation"], item["object"])
+            if key not in seen:
+                seen[key] = item
+        write_dicts = list(seen.values())
+
+        print(f"  冲突解决：{len(resolved_results)} 条已解决，{len(pending_resolution)} 条待定")
+        print(f"  去重后待写入：{len(write_dicts)} 条")
+
+        # 5. 写入 MongoDB（先写，获得 _id）
+        print("  写入 MongoDB...")
+        mongo_ids = self.mongo.write_inferred(write_dicts)
+        print(f"  MongoDB: 写入 {len(mongo_ids)} 条")
+
+        # 6. 写入 Neo4j（携带 mongo_id）
+        if self.neo4j:
+            print("  写入 Neo4j...")
+            for i, result in enumerate(write_dicts):
+                mid = mongo_ids[i] if i < len(mongo_ids) else None
+                try:
+                    self.neo4j.write_triple(
+                        subject=result["subject"],
+                        relation=result["relation"],
+                        obj=result["object"],
+                        confidence=result["confidence"],
+                        inferred=True,
+                        mongo_id=mid,
+                        source="reasoner_v2",
+                        hop_count=result.get("hop_count", 0),
+                        rule_tag=result.get("rule_tag", ""),
+                    )
+                    if mid:
+                        self.mongo.update_synced_status(mid, success=True)
+                except Exception as e:
+                    print(f"  ⚠️ Neo4j 写入失败: {e}")
+                    if mid:
+                        self.mongo.update_synced_status(mid, success=False, error=str(e))
+
+        # 返回写入的结果（与写入 MongoDB/Neo4j 的保持一致）
+        written_keys = {(x["subject"], x["relation"], x["object"]) for x in write_dicts}
+        written_results = [r for r in inferred_results
+                          if (r.subject, r.relation, r.object) in written_keys]
+        print(f"✅ Reasoner v2 完成: {len(write_dicts)} 条写入（{len(resolved_results)} 已解决 + {len(pending_resolution)} 待定）")
+        return written_results
+
+    def close(self):
+        self.mongo.close()
+        if self.neo4j:
+            self.neo4j.close()
+
+
+def run_reasoner():
+    """快捷入口"""
+    reasoner = ReasonerV2()
+    results = reasoner.run()
+    print(f"\nTop 10 推理结果:")
+    for r in results[:10]:
+        print(f"  {r.subject} --{r.relation}--> {r.object} (conf={r.confidence}, hops={r.hop_count})")
+    reasoner.close()
+    return results
+
+
+if __name__ == "__main__":
+    run_reasoner()

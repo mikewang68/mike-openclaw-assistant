@@ -1,0 +1,96 @@
+# 股票KG每日增量任务 prompt
+# 用途：Cron 每日 isolated session 执行
+# 1. 抓取近3天财经新闻（akshare + 东财API）
+# 2. LLM 抽取三元组
+# 3. 写入 MongoDB stock_kg（relation: NEWS_EVENT）
+# 4. 报告结果
+
+执行步骤：
+
+## 步骤1：抓新闻
+```python
+import akshare as ak, requests, time
+from datetime import datetime, timedelta
+
+# akshare 新闻
+df = ak.stock_news_em()
+news = []
+for _, row in df.iterrows():
+    news.append({
+        'title': str(row.get('新闻标题','')),
+        'source': str(row.get('文章来源','')),
+        'time': str(row.get('发布时间','')),
+    })
+
+# 东财公告（近3天）
+em_news = []
+for d in range(3):
+    date_str = (datetime.now() - timedelta(days=d)).strftime('%Y%m%d')
+    try:
+        url = f"https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1&page_size=20&page_index=1&ann_type=SHA,CYB,SZA&begin_date={date_str}&end_date={date_str}"
+        r = requests.get(url, timeout=5)
+        for item in r.json().get('data',{}).get('list',[]):
+            em_news.append({
+                'title': item.get('title',''),
+                'source': '东财公告',
+                'time': item.get('notice_date',''),
+            })
+        time.sleep(0.2)
+    except: pass
+
+all_news = news + em_news
+# 去重
+seen = set(); unique = []
+for n in all_news:
+    k = n['title'][:30]
+    if k not in seen:
+        seen.add(k); unique.append(n)
+print(f"去重后 {len(unique)} 条新闻")
+```
+
+## 步骤2：LLM抽取三元组
+用内置 LLM 抽取三元组（提示词如下）：
+```
+你是一个金融知识图谱抽取专家。从以下今日财经新闻中抽取知识三元组。
+
+要求：
+1. 每个三元组：{"subject": "公司/概念", "relation": "关系类型", "object": "对象", "evidence": "来源标题"}
+2. relation从以下选择：ANNOUNCED / RATED_BY / CONCEPT_HOT / PRICE_HOT / RELATED_TO / IN_INDUSTRY / PARTNERS_WITH
+3. subject 只抽取具体公司（A股常见）或具体概念（如"固态电池"），不要"市场"、"投资者"等
+4. 每条新闻最多3个三元组
+5. 输出严格JSON数组
+
+新闻：
+{每条新闻一行格式：- [来源] 时间: 标题}
+
+输出JSON数组：
+```
+
+## 步骤3：写入 MongoDB
+```python
+import pymongo
+from pymongo import UpdateOne
+client = pymongo.MongoClient('mongodb://stock:681123@192.168.1.2:27017/admin')
+db = client['stock']
+ops = []
+for t in triples:
+    ops.append(UpdateOne(
+        {'_id': f"{t['subject']}_{t['relation']}_{t['object']}_{datetime.now().strftime('%Y%m%d%H%M')}"},
+        {'$set': {
+            'subject': t['subject'], 'subject_name': t['subject'],
+            'relation': t['relation'], 'object': t['object'],
+            'evidence': t.get('evidence',''),
+            'source': 'daily_news', 'news_date': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat(),
+        }},
+        upsert=True
+    ))
+if ops: db['stock_kg'].bulk_write(ops, ordered=False)
+```
+
+## 步骤4：报告
+完成后输出：
+- 共处理多少条新闻
+- LLM抽取了多少三元组
+- 写入 stock_kg 多少条
+- stock_kg 当前总数

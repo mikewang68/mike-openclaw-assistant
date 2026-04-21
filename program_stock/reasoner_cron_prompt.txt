@@ -1,0 +1,8 @@
+# 每日16:05 - 盈亏追踪
+执行步骤：
+```bash
+python3 /program/stock/stock_outcome_tracker.py
+```
+读取昨日 stock_signals，计算每只信号的实际涨跌（1日/3日/5日）。
+写入 stock_outcome_history。
+结果推送到 Telegram（简洁版：胜率X%，平均盈亏Y%）

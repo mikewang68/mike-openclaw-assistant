@@ -1,0 +1,5 @@
+pymongo>=4.0
+neo4j>=5.0
+numpy>=1.0
+pandas>=2.0
+pdfminer.six

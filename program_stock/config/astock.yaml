@@ -1,0 +1,30 @@
+mongodb:
+  host: "192.168.1.2"
+  port: 27017
+  user: "stock"
+  password: "681123"
+  database: "stock"
+  auth_db: "admin"
+
+collections:
+  klines: "k_raw_v3"      # K线历史数据
+  code: "code"            # 股票代码映射
+  accounts: "accounts"    # 账户状态
+  orders: "orders"        # 成交记录
+  fin_lrb: "fin_lrb"      # 利润表
+  fin_zcfz: "fin_zcfz"    # 资产负债表
+  fin_xjll: "fin_xjll"    # 现金流量表
+  fin_yjbb: "fin_yjbb"    # 业绩报表
+
+data:
+  # 复权方式: qfq(前复权), hfq(后复权), none(不复权)
+  adjustment: "qfq"
+  cache_dir: "/program/stock/data/astock"
+
+broker:
+  # 券商接口配置（待接入）
+  # 可选: eastmoney(东方财富), futu(富途), snowflake(雪球)
+  type: "none"
+  api_url: ""
+  app_id: ""
+  account_id: ""
