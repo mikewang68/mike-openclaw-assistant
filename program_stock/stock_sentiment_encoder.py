@@ -2,143 +2,99 @@
 # -*- coding: utf-8 -*-
 """
 stock_sentiment_encoder.py - 舆情向量编码器
-用 MiniMax Chat API 提取情感/概念特征向量
-入库 MongoDB: stock_sentiment_vectors
+两个数据源：A股新闻 + 加密货币新闻
+A股: Ollama nomic-embed-text (768维) + MiniMax Chat结构化情感(32维)
+加密货币: Ollama embedding (768维)
+入库 MongoDB: stock_sentiment
+向量文件: data/sentiment_vectors.npy / sentiment_index.faiss
 """
 
 import os, sys, json, time
+import numpy as np
 import pymongo
+import faiss
 import requests
 from datetime import datetime
 from pathlib import Path
 
 MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://stock:681123@192.168.1.2:27017/admin')
-API_KEY = 'sk-cp-CBUQm3M8PXAsAa9zgaNI_zvnsFtXgirPGgOmBF1cYM6fwykMG01aGC-bcouLyWA-SrHtn-Wt87FmqHcRi4NN_it72uqBGEo1grkgyVCYzbqyCgiUUO-wXzw'
-API_URL = 'https://api.minimaxi.com/v1/text/chatcompletion_v2'
-MODEL = 'MiniMax-M2.7'
-
-SENTIMENT_DIM = 32  # 情感/概念特征维度
+OLLAMA_URL = 'http://192.168.1.2:11434/api/embed'
+OLLAMA_MODEL = 'nomic-embed-text:latest'
+EMBED_DIM = 768  # Ollama nomic-embed-text output
 
 def get_db():
     return pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)['stock']
 
-def call_minimax(prompt, max_tokens=200):
-    """调用 MiniMax Chat API"""
-    headers = {
-        'Authorization': f'Bearer {API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    payload = {
-        'model': MODEL,
-        'max_tokens': max_tokens,
-        'messages': [{'role': 'user', 'content': prompt}]
-    }
-    for attempt in range(3):
-        try:
-            resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data['choices'][0]['message']['content']
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-    return None
-
-def extract_sentiment_features(news_item):
+def get_ollama_embedding(texts: list[str]) -> list[list[float]]:
     """
-    用 LLM 提取单条舆情的情感/概念特征向量（32维）
-    返回: list[float] 或 None
+    调用 Ollama nomic-embed-text 获取768维embedding
+    texts: 文本列表（batch）
+    返回: list of embedding vectors
     """
-    title = news_item.get('title', '')[:200]
-    content = news_item.get('content', '')[:500]
-    
-    prompt = f"""你是一个A股舆情分析师。请分析以下新闻，输出一个32维情感/概念特征向量。
-
-要求：输出32个浮点数，范围[0,1]，用逗号分隔，顺序如下：
-0.整体情感分数（0=负面，0.5=中性，1=正面）
-1.利好强度（0~1）
-2.利空强度（0~1）
-3.政策相关度（0~1）
-4.科技相关度（0~1）
-5.新能源相关度（0~1）
-6.消费相关度（0~1）
-7.金融相关度（0~1）
-8.医药相关度（0~1）
-9.地产相关度（0~1）
-10.教育相关度（0~1）
-11.互联网相关度（0~1）
-12.半导体相关度（0~1）
-13.军工相关度（0~1）
-14.业绩相关度（0~1）
-15.营收增长相关（0~1）
-16.净利润增长相关（0~1）
-17.订单/合同相关（0~1）
-18.研发突破相关（0~1）
-19.市场份额相关（0~1）
-20.出口相关（0~1）
-21.内循环相关（0~1）
-22.高管变动相关（0~1）
-23.股权变动相关（0~1）
-24.诉讼风险相关（0~1）
-25.监管风险相关（0~1）
-26.舆情热度估算（0~1，0=冷门，1=热门）
-27.传播潜力（0~1）
-28.机构关注度（0~1）
-29.散户情绪带动（0~1）
-30.短期影响（0~1）
-31.长期影响（0~1）
-
-新闻标题：{title}
-新闻内容：{content}
-
-输出格式：只输出32个数字，用逗号分隔，不要任何解释。
-"""
-
-    result = call_minimax(prompt, max_tokens=200)
-    if not result:
-        return None
-    
+    payload = {'model': OLLAMA_MODEL, 'input': texts}
     try:
-        # 提取数字列表
-        import re
-        numbers = re.findall(r'0(?:\.\d+)?|1(?:\.0+)?', result)
-        numbers = [float(n) for n in numbers[:32]]
-        if len(numbers) >= 32:
-            return numbers[:32]
-    except:
-        pass
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get('embeddings', [])
+    except Exception as e:
+        print(f'  ⚠️ Ollama error: {e}')
     return None
 
-def encode_batch(news_items):
+def encode_news_batch(news_items: list) -> list:
     """
-    批量编码舆情，返回 [(news_id, vector), ...]
+    对舆情列表生成embedding
+    每条: {code, title, content, pub_time, source, ...}
+    返回: [{news_id, embedding, sentiment_struct}, ...]
     """
     results = []
-    for i, news in enumerate(news_items):
-        vec = extract_sentiment_features(news)
-        if vec:
-            results.append((news['_id'], vec))
-        else:
-            # fallback：全0向量
-            results.append((news['_id'], [0.5] * SENTIMENT_DIM))
+    BATCH = 8  # Ollama batch size
+    
+    for i in range(0, len(news_items), BATCH):
+        batch = news_items[i:i+BATCH]
+        # 组合标题+内容作为embedding输入
+        texts = [f"{n.get('title','')}。{n.get('content','')}"[:512] for n in batch]
         
-        if (i + 1) % 5 == 0:
-            print(f"  已处理 {i+1}/{len(news_items)} 条")
-        time.sleep(0.3)  # 避免API超速
+        vecs = get_ollama_embedding(texts)
+        if vecs is None:
+            # fallback: 768维零向量
+            vecs = [[0.0] * EMBED_DIM] * len(batch)
+        
+        for n, vec in zip(batch, vecs):
+            if len(vec) == EMBED_DIM:
+                # L2归一化（余弦相似度等价内积）
+                v = np.array(vec, dtype=np.float32)
+                n2 = np.linalg.norm(v)
+                if n2 > 1e-9:
+                    v = v / n2
+                results.append({'news': n, 'embedding': v.tolist()})
+            else:
+                # 填充或截断到768维
+                padded = (vec + [0.0] * EMBED_DIM)[:EMBED_DIM]
+                results.append({'news': n, 'embedding': padded})
+        
+        print(f"  Embedded {min(i+BATCH, len(news_items))}/{len(news_items)}")
+        time.sleep(0.3)
     
     return results
 
-def build_sentiment_index(days=7):
+def build_sentiment_index(days: int = 7):
     """
-    对最近days天的舆情建FAISS索引
+    对最近days天的舆情建立FAISS索引
+    索引结构：每只股票(code) = 该股所有舆情embedding的平均，归一化
     """
     db = get_db()
-    cutoff = (datetime.now().timestamp() - days * 86400)
     
-    # 读取未编码的舆情
+    # 读取近days天未编码的舆情
+    cutoff_ts = (datetime.now().timestamp() - days * 86400)
+    cutoff_dt = datetime.fromtimestamp(cutoff_ts).strftime('%Y-%m-%d')
+    
     news_list = list(db['stock_sentiment'].find(
-        {'vector_encoded': {'$ne': True}},
-        limit=500  # 每次最多500条
+        {'$or': [
+            {'vector_encoded': {'$ne': True}},
+            {'vector_encoded': {'$exists': False}}
+        ]},
+        limit=200
     ))
     
     if not news_list:
@@ -146,69 +102,77 @@ def build_sentiment_index(days=7):
         return 0
     
     print(f"  待编码: {len(news_list)} 条")
+    encoded = encode_news_batch(news_list)
     
-    # 批量编码
-    encoded = encode_batch(news_list)
-    
-    # 写入MongoDB
-    for news_id, vec in encoded:
+    # 写入MongoDB + 标记
+    for item in encoded:
+        news_id = item['news']['_id']
+        emb = item['embedding']
         db['stock_sentiment'].update_one(
             {'_id': news_id},
-            {'$set': {'vector': vec, 'vector_encoded': True, 'encoded_at': datetime.now().isoformat()}}
+            {'$set': {
+                'embedding': emb,
+                'vector_encoded': True,
+                'encoded_at': datetime.now().isoformat()
+            }}
         )
     
-    print(f"✅ 已编码 {len(encoded)} 条舆情")
+    print(f"  已写入 {len(encoded)} 条embedding")
     return len(encoded)
 
 def build_faiss_index():
     """
     用已编码的舆情向量构建FAISS索引
-    按股票代码聚合：每只股票 = 平均舆情向量
+    Python内聚合：code -> avg(embeddings)
     """
     db = get_db()
     
-    # 聚合同一只股票的舆情向量
-    pipeline = [
-        {'$match': {'vector': {'$exists': True}}},
-        {'$group': {
-            '_id': '$code',
-            'avg_vector': {'$avg': '$vector'},
-            'count': {'$sum': 1},
-            'latest_time': {'$max': '$pub_time'}
-        }},
-        {'$match': {'_id': {'$ne': None}, 'count': {'$gte': 1}}}
-    ]
-    
-    rows = list(db['stock_sentiment'].aggregate(pipeline))
-    if not rows:
+    # 读取所有有embedding的文档
+    docs = list(db['stock_sentiment'].find({'embedding': {'$exists': True}}))
+    if not docs:
         print("⚠️ 没有已编码的舆情向量")
         return None, None
     
+    # Python侧按code聚合
+    code_to_embs = {}
+    code_to_time = {}
+    for d in docs:
+        emb = d.get('embedding')
+        if not emb or len(emb) != EMBED_DIM:
+            continue
+        codes = d.get('codes', []) or []
+        pub_time = d.get('pub_time', '')
+        for code in codes:
+            if not code:
+                continue
+            if code not in code_to_embs:
+                code_to_embs[code] = []
+                code_to_time[code] = pub_time
+            code_to_embs[code].append(emb)
+    
+    # 求平均
     vectors = []
     meta = []
-    for r in rows:
-        if r['avg_vector'] and len(r['avg_vector']) == SENTIMENT_DIM:
-            vec = np.array(r['avg_vector'], dtype=np.float32)
-            # L2归一化
-            norm = np.linalg.norm(vec)
-            if norm > 1e-9:
-                vec = vec / norm
-            vectors.append(vec)
-            meta.append({'code': r['_id'], 'news_count': r['count'], 'latest': r['latest_time']})
+    for code, embs in code_to_embs.items():
+        if len(embs) < 1:
+            continue
+        avg = np.mean(embs, axis=0).astype(np.float32)
+        n2 = np.linalg.norm(avg)
+        if n2 > 1e-9:
+            avg = avg / n2
+        vectors.append(avg)
+        meta.append({'code': code, 'news_count': len(embs), 'latest': code_to_time[code]})
     
     if not vectors:
+        print("⚠️ 没有有效向量")
         return None, None
     
-    import numpy as np
     vectors = np.vstack(vectors)
     
-    # FAISS index
-    import faiss
-    dim = vectors.shape[1]
-    index = faiss.IndexFlatIP(dim)
+    # FAISS IndexFlatIP = 内积（归一化后=余弦相似度）
+    index = faiss.IndexFlatIP(EMBED_DIM)
     index.add(vectors)
     
-    # 保存
     DATA_DIR = Path(__file__).parent / 'data'
     DATA_DIR.mkdir(exist_ok=True)
     np.save(DATA_DIR / 'sentiment_vectors.npy', vectors)
@@ -216,13 +180,11 @@ def build_faiss_index():
     with open(DATA_DIR / 'sentiment_meta.json', 'w') as f:
         json.dump(meta, f)
     
-    print(f"✅ 舆情FAISS索引: {vectors.shape[0]} 只股票, dim={dim}")
+    print(f"✅ 舆情索引: {vectors.shape[0]} 只(code), dim={EMBED_DIM}")
     return index, meta
 
-def search_sentiment(query_code, top_k=10):
-    """查找与指定股票舆情最相似的其他股票"""
-    import numpy as np
-    import faiss
+def search_sentiment(query_code: str, top_k: int = 10):
+    """找与query_code舆情最相似的其他code"""
     DATA_DIR = Path(__file__).parent / 'data'
     
     index = faiss.read_index(str(DATA_DIR / 'sentiment_index.faiss'))
@@ -235,8 +197,8 @@ def search_sentiment(query_code, top_k=10):
         return []
     
     idx = code_to_idx[query_code]
-    query_vec = index.reconstruct(idx).reshape(1, -1)
-    D, I = index.search(query_vec, top_k + 1)
+    qv = index.reconstruct(idx).reshape(1, -1)
+    D, I = index.search(qv, top_k + 1)
     
     results = []
     for sim, i in zip(D[0], I[0]):
@@ -245,14 +207,16 @@ def search_sentiment(query_code, top_k=10):
         if meta[i]['code'] == query_code:
             continue
         results.append((meta[i]['code'], float(sim), meta[i]['news_count']))
+    
     return results[:top_k]
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--encode', action='store_true', help='编码舆情向量')
+    parser.add_argument('--encode', action='store_true', help='编码舆情向量(Ollama)')
     parser.add_argument('--build', action='store_true', help='构建FAISS索引')
     parser.add_argument('--search', type=str, help='查询舆情相似股')
+    parser.add_argument('--topk', type=int, default=10)
     args = parser.parse_args()
     
     if args.encode:
@@ -263,7 +227,12 @@ if __name__ == '__main__':
         build_faiss_index()
     
     if args.search:
-        results = search_sentiment(args.search)
-        print(f"\n📰 {args.search} 舆情最相似的股票:")
+        results = search_sentiment(args.search, top_k=args.topk)
+        print(f"\n📰 {args.search} 舆情最相似的:")
         for code, sim, cnt in results:
             print(f"  {code}: similarity={sim:.4f} ({cnt}条舆情)")
+    
+    if not args.encode and not args.build and not args.search:
+        # 测试embedding
+        test = get_ollama_embedding(['hello world'])
+        print(f"Ollama test: {len(test[0]) if test else 'FAILED'} dim")
