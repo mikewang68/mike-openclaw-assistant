@@ -1,4 +1,5 @@
--e __pycache__/
 *.pyc
-.git
+__pycache__/
+.git/
 node_modules/
+*.pyc
