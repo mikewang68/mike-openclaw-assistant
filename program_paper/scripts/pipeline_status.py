@@ -140,7 +140,100 @@ def get_heartbeat_age():
     except Exception:
         return 999999
 
-if __name__ == "__main__":
+def get_paper_state(paper_id):
+    """读取指定论文的状态（从status.json）"""
+    s = load_status()
+    papers = s.get("papers", {})
+    return papers.get(paper_id, {})
+
+def set_paper_state(paper_id, state=None, step=None, retry=0, reason=None):
+    """更新指定论文的状态到status.json"""
+    s = load_status()
+    papers = s.get("papers", {})
+    
+    if paper_id not in papers:
+        papers[paper_id] = {"status": "pending", "reviewer_done": False, "coach_done": False, "code_done": False, "retries": 0}
+    
+    ps = papers[paper_id]
+    if state is not None:
+        ps["status"] = state
+    if step is not None:
+        ps["current_step"] = step
+    if retry is not None:
+        ps["retries"] = retry
+    if reason is not None:
+        ps["reason"] = reason
+    ps["updated_at"] = datetime.now().isoformat()
+    
+    s["papers"] = papers
+    s["last_heartbeat"] = datetime.now().isoformat()
+    save_status(s)
+    return ps
+
+def list_papers_by_status(status_filter=None, step_filter=None):
+    """列出指定状态的论文"""
+    s = load_status()
+    papers = s.get("papers", {})
+    result = []
+    for pid, ps in papers.items():
+        if status_filter and ps.get("status") != status_filter:
+            continue
+        if step_filter and ps.get("current_step") != step_filter:
+            continue
+        result.append((pid, ps))
+    return result
+
+def get_pending_reviewers(limit=3):
+    """获取待处理reviewer的论文（最多返回limit个）"""
+    s = load_status()
+    passed = s.get("papers_passed", [])
+    papers = s.get("papers", {})
+    
+    pending = []
+    for pid in passed:
+        ps = papers.get(pid, {})
+        if ps.get("status") == "pending" or ps.get("current_step") == "reviewer":
+            pending.append(pid)
+        if len(pending) >= limit:
+            break
+    return pending[:limit]
+
+def update_counts():
+    """根据papers字典统计计数并更新到顶层字段"""
+    s = load_status()
+    papers = s.get("papers", {})
+    
+    total = len(s.get("papers_passed", []))
+    completed = sum(1 for ps in papers.values() if ps.get("status") == "completed")
+    failed = sum(1 for ps in papers.values() if ps.get("status") in ("failed", "killed"))
+    skipped = sum(1 for ps in papers.values() if ps.get("status") == "score_too_low")
+    
+    s["papers_total"] = total
+    s["papers_completed"] = completed
+    s["papers_failed"] = failed
+    s["papers_skipped"] = skipped
+    save_status(s)
+    return total, completed, failed, skipped
+
+def pass_papers(paper_ids):
+    """记录通过Phase1b的论文列表（初始化papers字典）"""
+    s = load_status()
+    s["papers_passed"] = paper_ids
+    # 初始化每篇论文状态
+    papers = {}
+    for pid in paper_ids:
+        papers[pid] = {
+            "status": "pending",
+            "reviewer_done": False,
+            "coach_done": False,
+            "code_done": False,
+            "retries": 0,
+            "current_step": None,
+            "updated_at": datetime.now().isoformat()
+        }
+    s["papers"] = papers
+    save_status(s)
+    return len(paper_ids)
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     
     if cmd == "start":
@@ -227,7 +320,47 @@ if __name__ == "__main__":
         s = load_status()
         print(json.dumps(s, indent=2, ensure_ascii=False))
         
+    elif cmd == "pass_papers":
+        # pass_papers: 从 passed.json 初始化论文状态
+        import sys; sys.path.insert(0, '/program/paper/scripts')
+        date_str = sys.argv[2] if len(sys.argv) > 2 else datetime.now().strftime("%Y-%m-%d")
+        base = f"/home/node/.openclaw/workspace/workareas/shared/papers/{date_str}"
+        passed_path = os.path.join(base, "passed.json")
+        if os.path.exists(passed_path):
+            with open(passed_path) as f:
+                passed_list = json.load(f)
+            paper_ids = [p['arxiv_id'].split('v')[0] for p in passed_list]
+            result = pass_papers(paper_ids)
+            print(f"✅ Initialized {result} papers for {date_str}")
+        else:
+            print(f"⚠️  passed.json not found at {passed_path}")
+            sys.exit(1)
+    
+    elif cmd == "pending":
+        # pending: 列出待处理论文
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+        pending = get_pending_reviewers(limit=limit)
+        for pid in pending:
+            print(pid)
+    
+    elif cmd == "set_paper":
+        # set_paper <arxiv_id> <state> [step] [retry]
+        paper_id = sys.argv[2] if len(sys.argv) > 2 else None
+        state = sys.argv[3] if len(sys.argv) > 3 else None
+        step = sys.argv[4] if len(sys.argv) > 4 else None
+        retry = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        if paper_id and state:
+            ps = set_paper_state(paper_id, state=state, step=step, retry=retry)
+            print(f"✅ {paper_id}: {state} (step={step})")
+        else:
+            print("Usage: set_paper <arxiv_id> <state> [step] [retry]")
+            sys.exit(1)
+    
+    elif cmd == "counts":
+        total, completed, failed, skipped = update_counts()
+        print(f"Total: {total}, Completed: {completed}, Failed: {failed}, Skipped: {skipped}")
+    
     else:
         print(f"Unknown command: {cmd}")
-        print("Usage: pipeline_status.py [start|complete|crash|heartbeat|phase1a|phase1b|phase2a|phase2b|update|status|crashed_check]")
+        print("Usage: pipeline_status.py [start|complete|crash|heartbeat|phase1a|phase1b|phase2a|phase2b|update|status|pass_papers|pending|set_paper|counts]")
         sys.exit(1)
