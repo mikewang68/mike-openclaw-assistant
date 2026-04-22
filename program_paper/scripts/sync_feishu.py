@@ -223,7 +223,18 @@ def main():
         sys.exit(1)
 
     if os.path.exists(pdf_path):
-        file_token = upload_file(pdf_path, token, config["app_token"])
+        pdf_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+        if pdf_size_mb > 20:
+            # PDF > 20MB: create TXT with arXiv URL instead
+            arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            txt_path = pdf_path.replace('.pdf', '.txt')
+            with open(txt_path, 'w') as f:
+                f.write(arxiv_url)
+            print(f"  PDF is {pdf_size_mb:.1f}MB > 20MB, uploading TXT with URL instead")
+            file_token = upload_file(txt_path, token, config["app_token"])
+            os.remove(txt_path)  # clean up temp txt
+        else:
+            file_token = upload_file(pdf_path, token, config["app_token"])
         if file_token:
             if "论文" not in fields:
                 fields["论文"] = []
