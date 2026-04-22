@@ -134,16 +134,46 @@ def insert_record(token, app_token, table_id, fields):
         sys.exit(1)
 
 def extract_arxiv_id(md_path, md_content):
-    """Extract arXiv ID from markdown path, source field, or content."""
-    # 1. Try to extract from markdown file path: YYYY-MM-DD-title-评阅意见.md (新格式，无arXivID)
-    m = re.search(r'(260[1-9]\.\d{5})', md_path)
-    if m:
-        return m.group(1)
-    # 2. Try standard content patterns
-    for pat in [r'\[\[(\d{4}\.\d{5})[^\]]*\]\]', r'arXiv:\s*(\d{4}\.\d{5})', r'arxiv\.org/abs/(\d{4}\.\d{5})']:
-        m = re.search(pat, md_content)
+    """Extract ArXiv ID - tries multiple strategies in priority order.
+    
+    Most reliable: find reviewer.json in shared/papers/{date}/ by matching title
+    stored in the reviewer's part1.title, then extract from reviewer's part1.source.
+    """
+    import os, glob, json
+    
+    # Strategy 1: Search papers directories by title match
+    title_match = re.search(r'\*\*Title\*\*:\s*(.+)', md_content)
+    if title_match:
+        paper_title = title_match.group(1).strip()[:50]
+        
+        papers_base = '/home/node/.openclaw/workspace/workareas/shared/papers'
+        if os.path.exists(papers_base):
+            for date_dir in sorted(os.listdir(papers_base), reverse=True):
+                date_path = os.path.join(papers_base, date_dir)
+                if not os.path.isdir(date_path) or not date_dir.startswith('202'):
+                    continue
+                for arxiv_id_dir in os.listdir(date_path):
+                    reviewer_path = os.path.join(date_path, arxiv_id_dir, 'reviewer.json')
+                    if os.path.exists(reviewer_path):
+                        try:
+                            with open(reviewer_path) as f:
+                                rj = json.load(f)
+                            rj_title = rj.get('part1', {}).get('title', '')[:50]
+                            if rj_title == paper_title:
+                                source = rj.get('part1', {}).get('source', '')
+                                m = re.search(r'(\d{4}\.\d{5})', source)
+                                if m:
+                                    return m.group(1)
+                        except:
+                            pass
+    
+    # Strategy 2: arxiv links in main content only (before coach suggestions)
+    main_content = md_content.split('【修改建议】')[0] if '【修改建议】' in md_content else md_content
+    for pat in [r'arxiv\.org/abs/(\d{4}\.\d{5})', r'arXiv:\s*(\d{4}\.\d{5})']:
+        m = re.search(pat, main_content)
         if m:
             return m.group(1)
+    
     return None
 
 def parse_markdown_to_fields(md_content):
@@ -226,7 +256,7 @@ def main():
         pdf_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
         if pdf_size_mb > 20:
             # PDF > 20MB: create TXT with arXiv URL instead
-            arxiv_url = f"https://arxiv.org/abs/{arxiv_id}" if arxiv_id else f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+            arxiv_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf" if arxiv_id else "https://arxiv.org"
             txt_path = pdf_path.replace('.pdf', '.txt')
             with open(txt_path, 'w') as f:
                 f.write(arxiv_url)
