@@ -34,6 +34,40 @@
 - Cron `0 0 * * *` 定时触发（每日00:00 Asia/Shanghai）
 - Mike 说"查arXiv论文"
 
+## Pipeline恢复检查（每次启动时自动执行）
+
+**在执行任何步骤之前**，先检查是否有未完成的pipeline需要恢复：
+
+```bash
+python3 /program/paper/scripts/pipeline_status.py status
+```
+
+**判断逻辑**：
+```
+读取 _pipeline_status.json
+    │
+    ▼
+┌─────────────────────────────────────┐
+│ status = idle / completed          │
+│ → 正常启动（新pipeline）             │
+└─────────────────────────────────────┘
+    │
+┌─────────────────────────────────────┐
+│ status = crashed / running          │
+│ 且 last_heartbeat > 15分钟          │
+│ → 执行断点续跑                      │
+└─────────────────────────────────────┘
+```
+
+**断点续跑步骤**：
+1. 读取 `papers/` 字典，找出每篇论文当前状态
+2. 跳过已完成的（coach_done=True）
+3. 对缺少 reviewer.json 的论文 → 启动 Reviewer
+4. reviewer.json 存在但缺 coach.json → 启动 Coach（≥80分）
+5. coach.json 存在但缺 MD/PDF → 执行 Code
+6. 写入 `pipeline_status.py start "{date}"` 恢复状态
+7. 向 Mike 报告：「Pipeline从断点恢复，X篇待处理」
+
 ## 全局Pipeline状态文件
 
 **路径**：`/home/node/.openclaw/workspace/workareas/shared/papers/_pipeline_status.json`
@@ -302,7 +336,7 @@ Cron/Mike 触发
     - V1/V2 由 **Main Agent exec** 调用 `/program/paper/scripts/verify_v1.py` / `/program/paper/scripts/verify_v2.py`，**不是独立的 verifier subagent**
     - subagent 只负责生成 JSON，Main Agent 负责验证和调度
 
-    ### V1失败处理（最多2次机会）
+    ### V1失败处理（最多2次机会，含429检测）
     ```
     Reviewer生成reviewer.json
          │
@@ -315,18 +349,31 @@ Cron/Mike 触发
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第1次失败 │ → respawn Reviewer（重试1次）
+    │ 检测是否 │
+    │ 429截断 │ → 是（JSON无效/截断）→ 指数退避重试（30s→60s→120s）
+    │ 格式错误 │ → 否 → 进入重试判断
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第2次失败 │ → Main Agent亲自接管，生成Part1-3 JSON写入reviewer.json
+    │ 第1次失败 │ → 退避30s后 respawn Reviewer
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第2次失败 │ → 退避60s后 respawn Reviewer
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第3次失败 │ → Main Agent亲自接管，生成Part1-3 JSON写入reviewer.json
     └────┬────┘
          │
          ▼
       进入Coach（无论成功与否继续）
     ```
 
-    ### V2失败处理（最多2次机会）
+    **429截断判定**：reviewer.json存在但JSON无效（json.JSONDecodeError），或文件大小<500字节
+    **退避策略**：30s → 60s → 120s（最多3次重试）
+
+    ### V2失败处理（最多2次机会，含429检测）
     ```
     Coach生成coach.json
          │
@@ -339,16 +386,29 @@ Cron/Mike 触发
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第1次失败 │ → 先修复JSON（引号/格式），再respawn Coach
+    │ 检测是否 │
+    │ 429截断 │ → 是（JSON无效/截断）→ 指数退避重试（30s→60s→120s）
+    │ 格式错误 │ → 否 → 先修复JSON引号/格式，再重试
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第2次失败 │ → Main Agent亲自接管，生成Part4-5 JSON写入coach.json
+    │ 第1次失败 │ → 退避30s后 respawn Coach
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第2次失败 │ → 退避60s后 respawn Coach
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第3次失败 │ → Main Agent亲自接管，生成Part4-5 JSON写入coach.json
     └────┬────┘
          │
          ▼
       进入Code（无论成功与否继续）
     ```
+
+    **429截断判定**：coach.json存在但JSON无效（json.JSONDecodeError），或文件大小<500字节
+    **退避策略**：30s → 60s → 120s（最多3次重试）
 
     ### V3失败处理
     ```
