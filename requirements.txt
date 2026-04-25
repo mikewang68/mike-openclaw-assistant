@@ -1,0 +1,56 @@
+# OpenClaw 统一 Python 依赖
+# 所有 program_* / program/ 模块启动时都应检查此文件并安装缺失依赖
+
+# 数据处理
+pandas>=2.0
+numpy>=1.21
+
+# 币安接口
+python-binance>=1.0
+
+# 技术分析
+ta>=0.10
+talib>=0.4.24  # 需要系统库 TA-Lib（apt install ta-lib libta-lib-dev）
+
+# 量化交易
+backtrader>=1.9
+akshare>=1.10
+
+# 数据库
+pymongo>=4.0
+neo4j>=5.0
+
+# PDF处理
+pdfminer.six
+
+# HTTP / API
+requests>=2.28
+httpx>=0.25
+
+# Telegram通知
+python-telegram-bot>=20
+
+# 定时任务
+schedule>=1.2
+
+# Web框架
+flask>=2.0
+flask-cors>=3.0
+flask-socketio>=5.0
+
+# 配置
+pyyaml>=6.0
+python-dotenv>=0.19
+
+# ML（可选）
+scikit-learn>=1.0
+xgboost>=1.5
+
+# 日期处理
+python-dateutil>=2.8
+pytz
+dateparser
+tzlocal
+
+# 工具
+regex
