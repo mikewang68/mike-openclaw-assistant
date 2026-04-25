@@ -1,0 +1,8 @@
+pandas
+numpy
+python-binance
+ta
+requests
+schedule
+pyyaml
+python-telegram-bot
