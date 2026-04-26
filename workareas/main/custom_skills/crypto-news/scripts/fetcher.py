@@ -26,7 +26,7 @@ MONGO_URI = os.environ.get(
     'mongodb://stock:681123@192.168.1.2:27017/admin'
 )
 TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
-SEARXNG_URL = os.environ.get('SEARXNG_URL', '')  # 如 http://192.168.1.x:8888
+SEARXNG_URL = os.environ.get('SEARXNG_URL', 'http://192.168.1.2:38080')  # NAS SearXNG
 DB_NAME = "crypto"
 COLLECTION = "crypto_news"
 MAX_PER_SOURCE = 20

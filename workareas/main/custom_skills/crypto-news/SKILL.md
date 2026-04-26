@@ -19,8 +19,8 @@
 # Tavily API Key（已配置）
 TAVILY_API_KEY=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
 
-# SearXNG 自建实例（可选，未安装则跳过）
-# SEARXNG_URL=http://192.168.1.x:8888
+# SearXNG NAS 自建实例（已配置）
+SEARXNG_URL=http://192.168.1.2:38080
 
 # MongoDB
 MONGO_URI=mongodb://stock:681123@192.168.1.2:27017/admin
