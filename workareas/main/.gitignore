@@ -1,0 +1,29 @@
+# OpenClaw 内部文件
+.openclaw/
+.clawhub/
+.session_archive/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 敏感配置
+agents/
+auth-profiles.json
+*.json
+
+# 临时文件
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 预算/敏感数据
+memory/REALTIME_TRADE*.md
+memory/*TRADE*.md
+memory/*secret*.md
