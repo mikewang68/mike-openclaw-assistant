@@ -23,7 +23,7 @@
 
 ### 模式二：无字幕视频（Whisper 转写）
 1. 下载音视频 → `/obsidian/audio/{video_id}.wav`
-2. 按 **10MB** 分块 → `/obsidian/temp_chunks/{video_id}_chunks/chunk_0000.wav`
+2. 按 **9MB** 分块 → `/obsidian/temp_chunks/{video_id}_chunks/chunk_0000.wav`
 3. 逐块送 Whisper（`Systran/faster-whisper-tiny`）转写为文本
 4. 合并所有块的文本 → LLM 生成结构化总结
 5. 保存总结文件
