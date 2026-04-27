@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
 """
-youtube-summarize — YouTube 视频总结脚本
+youtube-summarize — YouTube 视频总结 Skill
+
+工作流程：
+  模式一（字幕）：YouTube字幕 → 直接LLM总结
+  模式二（无字幕）：下载音频(→/obsidian/audio) → 按10MB分块(→/obsidian/temp_chunks)
+                → 逐块Whisper转写 → 合并文本 → LLM总结 → 保存文件 → 清理临时文件
 
 用法：
   python3 summarize.py <YouTube_URL> [--output DIR]
-
-输出：
-  1. 优先获取 YouTube 字幕 → Whisper 转写（无字幕时）
-  2. 调用 LLM 生成结构化总结
-  3. 保存到 --output 指定的目录（默认 /obsidian/01_Input/01_视频/）
-  4. 打印 JSON + 保存路径
 """
 
 import sys
 import re
 import json
 import os
+import glob
 import subprocess
 import urllib.request
 import urllib.error
 from datetime import datetime
 
-# ─── 常量 ───────────────────────────────────────────────
-FFMPEG   = "/program/tools/ffmpeg"
-YT_DLP   = "/home/node/.local/bin/yt-dlp"
-WHISPER_API = "http://192.168.1.2:9000/v1/audio/transcriptions"
+# ─── 常量 ─────────────────────────────────────────────
+FFMPEG         = "/program/tools/ffmpeg"
+YT_DLP         = "/home/node/.local/bin/yt-dlp"
+WHISPER_API    = "http://192.168.1.2:9000/v1/audio/transcriptions"
+WHISPER_MODEL  = "Systran/faster-whisper-tiny"   # 可选：tiny/base/small/large-v3
+WHISPER_TIMEOUT = 300                            # 单块超时（秒）
+CHUNK_SIZE_MB  = 10                              # 音频分块大小（MB）
+AUDIO_DIR      = "/obsidian/audio"
+TEMP_DIR       = "/obsidian/temp_chunks"
 DEFAULT_OUTPUT = "/obsidian/01_Input/01_视频"
 LLM_API_KEY_FILE = "/home/node/.openclaw/agents/main/agent/auth-profiles.json"
-AUDIO_DIR = "/obsidian/audio"
-TEMP_CHUNKS_DIR = "/obsidian/temp_chunks"
 
 
-# ─── 工具函数 ───────────────────────────────────────────
+# ─── 工具函数 ─────────────────────────────────────────
 
 def extract_video_id(url: str) -> str:
     patterns = [
@@ -46,18 +49,10 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"无法从 URL 提取视频ID: {url}")
 
 
-def format_timestamp(seconds: float) -> str:
-    h, rem = divmod(int(seconds), 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 def get_llm_api_key() -> str:
-    """从 OpenClaw 配置读取 MiniMax API Key"""
     try:
-        import json as _json
         with open(LLM_API_KEY_FILE) as f:
-            data = _json.load(f)
+            data = json.load(f)
         for p in data.get('profiles', {}).values():
             if p.get('provider') == 'minimax-cn':
                 return p.get('key', '')
@@ -66,10 +61,7 @@ def get_llm_api_key() -> str:
     return ''
 
 
-def call_llm(prompt: str, model: str = "MiniMax-M2.7", temperature: float = 0.2) -> str:
-    """调用 MiniMax LLM 生成总结"""
-    import urllib.request, urllib.error
-
+def call_llm(prompt: str, model: str = "MiniMax-M2.7", temperature: float = 0.3) -> str:
     api_key = get_llm_api_key()
     if not api_key:
         print("[WARN] 未找到 LLM API Key，跳过 LLM 总结", file=sys.stderr)
@@ -99,10 +91,9 @@ def call_llm(prompt: str, model: str = "MiniMax-M2.7", temperature: float = 0.2)
         return ''
 
 
-# ─── 视频元数据 ─────────────────────────────────────────
+# ─── 视频元数据 ───────────────────────────────────────
 
 def get_video_metadata(url: str) -> dict:
-    """用 yt-dlp 获取视频元数据"""
     try:
         result = subprocess.run(
             [YT_DLP, '--dump-json', '--no-download', url],
@@ -112,7 +103,7 @@ def get_video_metadata(url: str) -> dict:
             data = json.loads(result.stdout)
             return {
                 'title':       data.get('title', ''),
-                'description':  data.get('description', ''),
+                'description': data.get('description', ''),
                 'duration':    data.get('duration', 0),
                 'tags':        data.get('tags', []),
                 'channel':     data.get('channel', ''),
@@ -125,17 +116,13 @@ def get_video_metadata(url: str) -> dict:
             'tags': [], 'channel': '', 'view_count': 0, 'upload_date': ''}
 
 
-# ─── 字幕获取 ───────────────────────────────────────────
+# ─── 字幕获取（模式一） ─────────────────────────────────
 
 def get_transcript(video_id: str):
-    """
-    获取 YouTube 字幕，返回 (语言代码, 段落列表)
-    段落: [{start, duration, text, timestamp}]
-    """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except ImportError:
-        raise RuntimeError("youtube_transcript_api 未安装")
+        raise RuntimeError("youtube_transcript_api 未安装，请 pip install youtube-transcript-api")
 
     api = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
@@ -162,76 +149,34 @@ def get_transcript(video_id: str):
     segments = []
     for s in fetched.snippets:
         segments.append({
-            'start':     float(s.start),
-            'duration':  float(s.duration),
-            'text':      s.text,
-            'timestamp':  format_timestamp(float(s.start))
+            'start':    float(s.start),
+            'duration': float(s.duration),
+            'text':     s.text,
+            'timestamp': f"{int(s.start//3600):02d}:{int(s.start%3600//60):02d}:{int(s.start%60):02d}",
         })
     return target.language_code, segments
 
 
-# ─── Whisper 转写 ────────────────────────────────────────
-
-def is_whisper_reachable(timeout: int = 5) -> bool:
-    """快速检测 Whisper API 是否可用（发送实际请求，timeout内判断）"""
-    import requests
-    import subprocess, os
-    os.makedirs(TEMP_CHUNKS_DIR, exist_ok=True)
-    probe_path = f"{TEMP_CHUNKS_DIR}/whisper_probe_{os.getpid()}.wav"
-    try:
-        subprocess.run([
-            FFMPEG, '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono',
-            '-t', '1', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-            probe_path, '-y'
-        ], capture_output=True, timeout=10)
-        if not os.path.exists(probe_path):
-            return False
-        with open(probe_path, 'rb') as f:
-            files = {'file': ('probe.wav', f, 'audio/wav')}
-            data = {'model': 'whisper-1', 'language': 'zh'}
-            resp = requests.post(WHISPER_API, files=files, data=data, timeout=timeout)
-            return resp.status_code == 200
-    except Exception:
-        return False
-    finally:
-        if os.path.exists(probe_path):
-            os.remove(probe_path)
-
-
-def transcribe_whisper(audio_path: str, timeout: int = 300) -> str:
-    """调用 NAS Whisper API 转写音频文件"""
-    import requests
-    with open(audio_path, 'rb') as f:
-        files = {'file': (os.path.basename(audio_path), f, 'audio/wav')}
-        data = {'model': 'whisper-1', 'language': 'zh', 'response_format': 'text'}
-        resp = requests.post(
-            WHISPER_API, files=files, data=data, timeout=timeout
-        )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Whisper API error {resp.status_code}: {resp.text}")
-    return resp.text.strip()
-
+# ─── 音频下载 ─────────────────────────────────────────
 
 def download_audio(url: str, output_path: str) -> str:
-    """用 yt-dlp 下载音频并用 ffmpeg 转换为 16kHz WAV"""
-    tmp_audio = output_path.replace('.wav', '.audio')
+    """下载音视频并转为 16kHz mono WAV，保存到 output_path"""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tmp_audio = output_path.replace('.wav', '.tmp')
 
     result = subprocess.run(
-        [
-            YT_DLP,
-            '-f', 'bestaudio/best',
-            '-o', tmp_audio + '.%(ext)s',
-            '--no-playlist', '--no-post-overwrites',
-            url
-        ],
+        [YT_DLP, '-f', 'bestaudio/best',
+         '-o', tmp_audio + '.%(ext)s',
+         '--no-playlist', '--no-post-overwrites',
+         url],
         capture_output=True, text=True, timeout=300
     )
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp 下载失败: {result.stderr}")
 
-    # 找到生成的音频文件
+    # 找到下载的音频文件
     found = None
-    for ext in ['.webm', '.mp3', '.m4a', '.ogg', '.aac']:
+    for ext in ['.webm', '.mp3', '.m4a', '.ogg', '.aac', '.wav']:
         candidate = tmp_audio + ext
         if os.path.exists(candidate):
             found = candidate
@@ -240,239 +185,304 @@ def download_audio(url: str, output_path: str) -> str:
         raise RuntimeError("yt-dlp 未生成音频文件")
 
     # ffmpeg 转换为 16kHz WAV
-    conv = subprocess.run(
+    conv_result = subprocess.run(
         [FFMPEG, '-i', found,
          '-vn', '-acodec', 'pcm_s16le',
          '-ar', '16000', '-ac', '1',
          '-y', output_path],
-        capture_output=True, timeout=120
+        capture_output=True, text=True, timeout=120
     )
-    if found != output_path:
+    if found != output_path and os.path.exists(found):
         os.remove(found)
     if not os.path.exists(output_path):
-        raise RuntimeError(f"ffmpeg 转换失败: {conv.stderr}")
+        raise RuntimeError(f"ffmpeg 转换失败: {conv_result.stderr}")
     return output_path
 
 
-# ─── LLM 总结生成 ────────────────────────────────────────
+# ─── 按大小分块 ───────────────────────────────────────
 
-def build_summary_prompt(title: str, description: str, channel: str,
-                         transcript: str, duration: int) -> str:
-    """构建 LLM 总结 prompt"""
+def split_audio_by_size(wav_path: str, chunk_dir: str, max_size_mb: int = CHUNK_SIZE_MB) -> list:
+    """按文件大小（MB）将 WAV 分割为多个块，返回每块的起始时间戳列表"""
+    os.makedirs(chunk_dir, exist_ok=True)
+    max_size_bytes = max_size_mb * 1024 * 1024
+
+    # 获取音频总时长
+    result = subprocess.run(
+        ['/program/tools/ffmpeg', '-i', wav_path],
+        capture_output=True, text=True
+    )
+    m = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', result.stderr)
+    if not m:
+        raise RuntimeError("无法获取音频时长")
+    total_secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+    # 估算每块时长：文件大小 / (采样率 * 通道数 * 字节深度) * 总时长
+    # 16kHz mono 16bit = 32000 bytes/s ≈ 0.032 MB/s
+    # 所以 max_size_bytes 对应的秒数 ≈ max_size_bytes / 32000
+    bytes_per_sec = 16000 * 1 * 2  # 16000Hz * 1ch * 2bytes
+    chunk_duration_sec = max_size_bytes / bytes_per_sec
+
+    chunks = []
+    start = 0.0
+    chunk_idx = 0
+    while start < total_secs:
+        chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
+        end = min(start + chunk_duration_sec, total_secs)
+        duration = end - start
+
+        print(f"  [{chunk_idx:02d}] {start:.1f}s-{end:.1f}s ({duration:.1f}s) → {chunk_path}",
+              flush=True)
+
+        subprocess.run([
+            FFMPEG, '-i', wav_path,
+            '-ss', str(start), '-t', str(duration),
+            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            chunk_path, '-y'
+        ], capture_output=True)
+
+        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1000:
+            chunks.append({'index': chunk_idx, 'start': start, 'end': end, 'path': chunk_path})
+        else:
+            print(f"  ⚠️ 块 {chunk_idx} 无效或过小，跳过")
+        start = end
+        chunk_idx += 1
+
+    print(f"  分块完成：共 {len(chunks)} 块")
+    return chunks
+
+
+# ─── Whisper 转写 ─────────────────────────────────────
+
+def transcribe_chunk(chunk_path: str) -> str:
+    """转写单个音频块，返回文本"""
+    import requests
+    with open(chunk_path, 'rb') as f:
+        files = {'file': (os.path.basename(chunk_path), f, 'audio/wav')}
+        data = {
+            'model':          WHISPER_MODEL,
+            'language':       'zh',
+            'response_format': 'text',
+        }
+        resp = requests.post(
+            WHISPER_API, files=files, data=data,
+            timeout=WHISPER_TIMEOUT
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Whisper {resp.status_code}: {resp.text[:200]}")
+    return resp.text.strip()
+
+
+def transcribe_all_chunks(chunks: list, video_id: str) -> str:
+    """逐块转写，合并为完整文本"""
+    all_texts = []
+    for chunk in chunks:
+        idx = chunk['index']
+        path = chunk['path']
+        size_mb = os.path.getsize(path) / 1024 / 1024
+        print(f"  转写块 {idx:02d}/{len(chunks)} ({size_mb:.1f}MB)...", end='', flush=True)
+        try:
+            text = transcribe_chunk(path)
+            if text:
+                print(f" ✅ {len(text)}字")
+                all_texts.append(f"[{idx:02d}] {text}")
+            else:
+                print(f" ✅ (空)")
+                all_texts.append(f"[{idx:02d}] ")
+        except Exception as e:
+            print(f" ❌ {e}")
+            all_texts.append(f"[{idx:02d}] [转写失败]")
+    return '\n'.join(all_texts)
+
+
+# ─── 清理临时文件 ─────────────────────────────────────
+
+def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
+    """删除音频源文件和分块目录"""
+    # 删除音频
+    if audio_path and os.path.exists(audio_path):
+        try:
+            os.remove(audio_path)
+            print(f"[CLEAN] 删除音频: {audio_path}")
+        except Exception as e:
+            print(f"[WARN] 删除音频失败: {e}")
+
+    # 删除分块目录
+    if os.path.exists(chunk_dir):
+        for f in os.listdir(chunk_dir):
+            fp = os.path.join(chunk_dir, f)
+            try:
+                os.remove(fp)
+            except Exception:
+                pass
+        try:
+            os.rmdir(chunk_dir)
+            print(f"[CLEAN] 删除目录: {chunk_dir}")
+        except Exception:
+            pass
+
+
+# ─── LLM 总结 ────────────────────────────────────────
+
+def build_summary_prompt(title: str, channel: str, duration: int,
+                         transcript: str, url: str) -> str:
     minutes = duration // 60
     date_str = datetime.now().strftime('%Y-%m-%d')
 
-    prompt = f"""你是一个专业的视频内容总结专家。请根据以下YouTube视频信息，生成结构化总结。
+    return f"""你是一个专业的技术视频内容总结专家。请根据以下视频字幕，生成结构化Markdown总结。
 
 ## 视频信息
 - 标题：{title}
 - 频道：{channel}
 - 时长：{minutes}分钟
-- 日期：{date_str}
-- 简介：{description[:500]}
+- 链接：{url}
+- 总结日期：{date_str}
 
 ## 字幕/转写内容
-{transcript[:8000]}
+{transcript[:15000]}
 
 ## 输出要求
-请生成以下结构的总结，**严格使用中文**，用 Markdown 格式：
+请按以下结构生成总结，用中文输出 Markdown 格式：
 
-```markdown
-# 【视频标题】
+### 基本信息
+视频概要（一句话总结，1-2句）
 
-- **视频链接**：[URL]
-- **频道**：[频道名]
-- **时长**：[X]分钟
-- **总结日期**：[YYYY-MM-DD]
+### 内容摘要
+按时间线或主题分段总结，每段包含关键观点、重要数据和出处
 
----
+### 核心要点：XX 技术演进路线（如适用）
+用表格或时间线形式梳理技术版本演进
 
-## 视频概要
-[2-3句话概括视频核心内容]
+### 关键技术解析
+挑选视频中重点讲解的3-5个技术点，用"是什么 + 为什么重要 + 核心原理"结构说明
 
----
-
-## 核心内容
-[按时间线或主题分段详细总结，每段包含：
-- 关键观点/概念
-- 重要细节和数据
-- 相关参考来源]
-
----
-
-## 关键概念/术语
-[列出视频中出现的核心术语或概念，并简要解释]
-
----
-
-## 参考来源
-[视频中提到的链接、论文、工具等项目]
-
----
-
-## 个人点评
-[对视频内容的评价：价值、局限性、启发等]
-```
+### 个人点评
+对视频内容的评价：价值、局限性、启发
 
 注意：
-1. 如果字幕是英文，请先翻译成中文再总结
-2. 要提取视频中的具体信息（人名、机构名、链接、数据）
-3. 如果转写质量差（大量无意义文本），请标注"转写质量较差，内容可能不准确"
+1. 如果转写质量差（大量无意义文本），请标注"转写质量较差，内容可能不准确"
+2. 技术细节需准确，无法确认的部分请注明"（待核实）"
+3. 提取视频中的具体信息（人名、机构名、数据）
 """
-    return prompt
 
 
-def generate_summary(metadata: dict, transcript: str) -> str:
-    """调用 LLM 生成结构化总结"""
+def generate_summary(metadata: dict, transcript: str, url: str) -> str:
     prompt = build_summary_prompt(
-        title       = metadata.get('title', ''),
-        description = metadata.get('description', ''),
-        channel     = metadata.get('channel', ''),
-        transcript  = transcript,
-        duration    = metadata.get('duration', 0),
+        title    = metadata.get('title', ''),
+        channel  = metadata.get('channel', ''),
+        duration = metadata.get('duration', 0),
+        transcript= transcript,
+        url      = url,
     )
-    summary = call_llm(prompt)
-    return summary
+    return call_llm(prompt)
 
 
-# ─── 主流程 ─────────────────────────────────────────────
+# ─── 主流程 ───────────────────────────────────────────
 
 def main():
     url = None
     output_dir = DEFAULT_OUTPUT
 
-    for arg in sys.argv[1:]:
+    for i, arg in enumerate(sys.argv[1:]):
         if arg.startswith('http'):
             url = arg
-        elif arg == '--output' or arg == '-o':
-            idx = sys.argv.index(arg) + 1
-            if idx < len(sys.argv):
-                output_dir = sys.argv[idx]
+        elif arg in ('--output', '-o') and i + 2 < len(sys.argv):
+            output_dir = sys.argv[sys.argv.index(arg) + 1]
 
     if not url:
         print("用法: python3 summarize.py <YouTube_URL> [--output DIR]", file=sys.stderr)
         sys.exit(1)
 
     video_id = extract_video_id(url)
-    print(f"[INFO] 视频ID: {video_id}", file=sys.stderr)
+    print(f"[INFO] 视频ID: {video_id}")
 
-    # ── 步骤1：获取视频元数据 ──
-    print(f"[INFO] 获取视频元数据...", file=sys.stderr)
+    # ── 步骤1：获取元数据 ──
+    print("[INFO] 获取视频元数据...")
     metadata = get_video_metadata(url)
 
-    # ── 步骤2：获取字幕 or Whisper 转写 ──
-    mode = "none"
+    mode = "unknown"
     lang = "unknown"
     full_text = ""
-    transcript_error = ""
+    transcript_file = None
 
-    # 优先字幕
+    # ── 步骤2：字幕优先 ──
     try:
         lang, segments = get_transcript(video_id)
         full_text = ' '.join([s['text'] for s in segments])
         mode = "transcript"
-        print(f"[INFO] 字幕获取成功，语言: {lang}，字数: {len(full_text)}", file=sys.stderr)
+        print(f"[INFO] 字幕获取成功，语言: {lang}，字数: {len(full_text)}")
     except Exception as e:
-        transcript_error = str(e)
-        print(f"[WARN] 字幕获取失败: {e}，尝试 Whisper...", file=sys.stderr)
+        print(f"[WARN] 字幕获取失败: {e}，切换 Whisper 模式", file=sys.stderr)
 
-        # Whisper 转写（先快速检测服务是否可用）
-        if is_whisper_reachable(timeout=5):
-            os.makedirs(AUDIO_DIR, exist_ok=True)
-            audio_wav = f"{AUDIO_DIR}/{video_id}.wav"
-            transcript_txt = f"{TEMP_CHUNKS_DIR}/{video_id}_transcript.txt"
-            try:
-                print(f"[INFO] 下载音频到 {AUDIO_DIR}...", file=sys.stderr)
-                download_audio(url, audio_wav)
+        # ── 步骤2b：下载音频 → /obsidian/audio ──
+        audio_path = f"{AUDIO_DIR}/{video_id}.wav"
+        chunk_dir  = f"{TEMP_DIR}/{video_id}_chunks"
 
-                # 调用分段转写脚本（进度保存到 TEMP_CHUNKS_DIR）
-                whisper_script = os.path.join(os.path.dirname(__file__), 'whisper_transcribe.py')
-                print(f"[INFO] Whisper 分段转写中（请耐心）...", file=sys.stderr)
-                result = subprocess.run(
-                    [sys.executable, whisper_script, audio_wav, transcript_txt],
-                    capture_output=True, text=True, timeout=3600
-                )
-                if result.returncode == 0 and os.path.exists(transcript_txt):
-                    with open(transcript_txt) as f:
-                        full_text = f.read().strip()
-                    if full_text:
-                        mode = "whisper"
-                        lang = "zh"
-                        print(f"[INFO] Whisper 转写成功，字数: {len(full_text)}", file=sys.stderr)
-                    else:
-                        raise ValueError("转写结果为空")
-                else:
-                    raise RuntimeError(result.stderr or result.stdout or "转写脚本失败")
-            except Exception as e2:
-                print(f"[WARN] Whisper 转写失败: {e2}，使用元数据总结", file=sys.stderr)
-                transcript_error += f" | Whisper失败: {e2}"
-                mode = "metadata_only"
-                full_text = metadata.get('description', '') or metadata.get('title', '')
-        else:
-            print(f"[WARN] Whisper API 不可用（192.168.1.2:9000 无响应），跳过转写", file=sys.stderr)
-            transcript_error = "Whisper API 不可用"
-            mode = "metadata_only"
-            full_text = metadata.get('description', '') or metadata.get('title', '')
-
-        # 清理临时音频文件
         try:
-            if 'audio_wav' in dir() and os.path.exists(audio_wav):
-                os.remove(audio_wav)
-                print(f"[INFO] 已删除临时音频: {audio_wav}", file=sys.stderr)
+            print(f"[INFO] 下载音频 → {audio_path}...")
+            download_audio(url, audio_path)
+            audio_size_mb = os.path.getsize(audio_path) / 1024 / 1024
+            print(f"[INFO] 音频大小: {audio_size_mb:.1f}MB")
         except Exception as e:
-            print(f"[WARN] 删除音频失败: {e}", file=sys.stderr)
+            print(f"[ERROR] 音频下载失败: {e}")
+            sys.exit(1)
 
-    # ── 步骤3：LLM 总结 ──
-    print(f"[INFO] 调用 LLM 生成总结...", file=sys.stderr)
-    summary = generate_summary(metadata, full_text)
+        # ── 步骤3：分块 → /obsidian/temp_chunks ──
+        print(f"[INFO] 按 {CHUNK_SIZE_MB}MB 分块...")
+        chunks = split_audio_by_size(audio_path, chunk_dir, CHUNK_SIZE_MB)
+        if not chunks:
+            print("[ERROR] 分块失败，无有效块")
+            sys.exit(1)
+
+        # ── 步骤4：逐块 Whisper 转写 ──
+        print(f"[INFO] 开始转写 {len(chunks)} 个音频块...")
+        full_text = transcribe_all_chunks(chunks, video_id)
+
+        transcript_file = f"{TEMP_DIR}/{video_id}_transcript.txt"
+        with open(transcript_file, 'w', encoding='utf-8') as f:
+            f.write(full_text)
+        print(f"[INFO] 转写完成，累计 {len(full_text)} 字")
+
+        # ── 步骤6（前置）：保存音频路径供清理用 ──
+        mode = "whisper"
+        lang = "zh"
+
+        # ── 步骤7：清理临时文件 ──
+        print("[INFO] 清理临时文件...")
+        cleanup_audio_and_chunks(audio_path, chunk_dir, video_id)
+        if transcript_file and os.path.exists(transcript_file):
+            os.remove(transcript_file)
+            print(f"[CLEAN] 删除 transcript: {transcript_file}")
+
+    # ── 步骤5：LLM 总结 ──
+    print("[INFO] 调用 LLM 生成总结...")
+    summary = generate_summary(metadata, full_text, url)
 
     if not summary:
-        print("[WARN] LLM 总结失败，仅保存原始数据", file=sys.stderr)
-        summary = f"**LLM 总结生成失败。**\n\n原始字幕/文本：\n\n{full_text[:3000]}"
+        print("[WARN] LLM 总结失败")
+        summary = f"# {metadata.get('title', '视频总结')}\n\n**LLM 总结生成失败。**\n\n原始文本：\n\n{full_text[:3000]}"
 
-    # ── 步骤4：保存文件 ──
+    # ── 步骤6：保存文件 ──
     date_str = datetime.now().strftime('%Y-%m-%d')
     safe_title = re.sub(r'[\\/:*?"<>|]', '_', metadata.get('title', 'untitled'))[:50]
     filename = f"{date_str}-youtube-{safe_title}.md"
     filepath = os.path.join(output_dir, filename)
-
     os.makedirs(output_dir, exist_ok=True)
+
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(summary)
+    print(f"[INFO] 已保存: {filepath}")
 
-    print(f"[INFO] 已保存: {filepath}", file=sys.stderr)
-
-    # ── 步骤5：清理临时 chunk 文件 ──
-    try:
-        import glob
-        for f in glob.glob(f"{TEMP_CHUNKS_DIR}/chunk_*.wav") + glob.glob(f"{TEMP_CHUNKS_DIR}/chunk_*.wav.*"):
-            try:
-                os.remove(f)
-            except:
-                pass
-        for f in glob.glob(f"{TEMP_CHUNKS_DIR}/*_progress.json"):
-            try:
-                os.remove(f)
-            except:
-                pass
-    except Exception as e:
-        print(f"[WARN] 清理chunk文件失败: {e}", file=sys.stderr)
-
-    # ── 步骤6：输出 JSON ──
+    # ── 输出 JSON ──
     result = {
         "video_id":    video_id,
         "url":         url,
         "mode":        mode,
         "language":    lang,
         "title":       metadata.get('title', ''),
-        "description": metadata.get('description', ''),
-        "duration":    metadata.get('duration', 0),
         "channel":     metadata.get('channel', ''),
-        "tags":        metadata.get('tags', []),
-        "transcript":  full_text[:500] if full_text else '',
+        "duration":    metadata.get('duration', 0),
+        "transcript_chars": len(full_text),
         "summary_file": filepath,
-        "transcript_file": transcript_txt if mode == "whisper" else None,
-        "transcript_error": transcript_error if transcript_error else None,
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
