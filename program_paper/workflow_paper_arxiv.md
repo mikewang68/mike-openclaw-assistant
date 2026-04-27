@@ -1,9 +1,14 @@
 # workflow_paper_arxiv.md - 每日arXiv论文审阅工作流
 
-**版本**：V8.27
-**最后更新**：2026-04-09
+**版本**：V9.0
+**最后更新**：2026-04-22
 
 **变更记录**：
+- V9.0：**状态外置化 + 稳定性修复**
+  - Pipeline Coordinator 不再靠 session 内存跟踪论文状态，改为写入 `pipeline_status.py papers` 字典
+  - Reviewer 并行度从 5 降到 3，减轻 coordinator 负担
+  - Coach 完成检查改为批量轮询（不再每条消息轮询）
+  - Coordinator 崩溃后可从 `_pipeline_status.json` 恢复，继续处理pending论文 - 所有阶段写入 `_pipeline_status.json`（通过 `pipeline_status.py`），支持 watchdog 独立检测崩溃；新增 crash 时自动调用 `pipeline_status.py crash`；watchdog cron 独立于 pipeline session
 - V8.27：**修复文件名算法不一致 + 原子化保证** - workflow文件名算法改为`re.sub(r'[^a-zA-Z0-9]', '_', title[:30])`（与markdown_generator.py的safe_name()完全一致）；新增Code阶段四步中途失败的原子清理逻辑
 - V8.26：**修复文件名日期bug** - 输出文件名改用`$(date +%Y-%m-%d)`（pipeline运行日期），不再使用论文目录`{date}`；论文提交日期保存到md内部`**Date**`字段
 - V8.25：**Code阶段完全固化** - 明确规定Code阶段=exec脚本（markdown_generator+verify_v3+sync_feishu），禁止使用subagent；预删除旧文件防残留；V3失败强制修复
@@ -28,6 +33,63 @@
 ## 触发条件
 - Cron `0 0 * * *` 定时触发（每日00:00 Asia/Shanghai）
 - Mike 说"查arXiv论文"
+
+## Pipeline恢复检查（每次启动时自动执行）
+
+**在执行任何步骤之前**，先检查是否有未完成的pipeline需要恢复：
+
+```bash
+python3 /program/paper/scripts/pipeline_status.py status
+```
+
+**判断逻辑**：
+```
+读取 _pipeline_status.json
+    │
+    ▼
+┌─────────────────────────────────────┐
+│ status = idle / completed          │
+│ → 正常启动（新pipeline）             │
+└─────────────────────────────────────┘
+    │
+┌─────────────────────────────────────┐
+│ status = crashed / running          │
+│ 且 last_heartbeat > 15分钟          │
+│ → 执行断点续跑                      │
+└─────────────────────────────────────┘
+```
+
+**断点续跑步骤**：
+1. 读取 `papers/` 字典，找出每篇论文当前状态
+2. 跳过已完成的（coach_done=True）
+3. 对缺少 reviewer.json 的论文 → 启动 Reviewer
+4. reviewer.json 存在但缺 coach.json → 启动 Coach（≥80分）
+5. coach.json 存在但缺 MD/PDF → 执行 Code
+6. 写入 `pipeline_status.py start "{date}"` 恢复状态
+7. 向 Mike 报告：「Pipeline从断点恢复，X篇待处理」
+
+## 全局Pipeline状态文件
+
+**路径**：`/home/node/.openclaw/workspace/workareas/shared/papers/_pipeline_status.json`
+
+**用途**：独立于 `status.json`，记录整条 pipeline 的运行状态。watchdog cron 读取此文件判断 pipeline 是否崩溃。
+
+**状态值**：`idle | running | completed | crashed`
+
+**管理脚本**：`python3 /program/paper/scripts/pipeline_status.py <command>`
+
+| 命令 | 作用 |
+|------|------|
+| `start <date> [session_id]` | Pipeline开始，记录started_at |
+| `heartbeat` | 更新last_heartbeat |
+| `phase1a/phase1b/phase2a/phase2b` | 标记当前阶段 |
+| `update --total N --completed N --failed N --skipped N` | 更新论文计数 |
+| `complete` | Pipeline正常结束 |
+| `crash <reason>` | Pipeline崩溃 |
+| `crashed_check` | watchdog检查：running但>15分钟无心跳=崩溃 |
+| `status` | 打印当前状态 |
+
+**原子性**：所有写入通过临时文件+rename保证原子性。
 
 ## 主动监控规则（必须遵守）
 
@@ -90,8 +152,8 @@ Phase2：🔄 进行中（X/Y完成）
 ## 核心约束
 
 1. **系统默认模型**：禁止指定模型版本
-2. **流水线并行执行**：Reviewer/Coach/Code三个阶段流水线并行，总共最多5个subagent同时运行
-   - 任何Reviewer完成 → 立即启动新Reviewer（保持5个并行）
+2. **流水线并行执行**：Reviewer/Coach/Code三个阶段流水线并行，总共最多3个subagent同时运行
+   - 任何Reviewer完成 → 立即启动新Reviewer（保持3个并行）
    - 任何Coach完成 → 立即启动该论文的Coach + 新Reviewer
    - 任何Coach完成 → 立即执行Code（不占subagent slot）
 3. **中文输出**：审阅意见中文，标题/摘要/引用英文原文
@@ -117,6 +179,9 @@ Phase2：🔄 进行中（X/Y完成）
 ```
 Cron/Mike 触发
     ↓
+【Pipeline启动】写入全局状态
+    python3 /program/paper/scripts/pipeline_status.py start "$(date +%Y-%m-%d)" "$SESSION_ID"
+    ↓
 【Phase1】Research（**Main Agent exec 执行，不走 subagent**）
     - 阶段1a：arXiv API 顺序搜索5方向 → 合并去重 → all_raw_papers.json
       **执行方式**：Main Agent exec 调用 `python3 /program/paper/scripts/search_arxiv_24h.py`
@@ -128,7 +193,7 @@ Cron/Mike 触发
       **⚠️ 强制约束：必须用 LLM，禁止规则匹配 ⚠️**
       
       **执行方式**：Main Agent exec 调用 `python3 /program/paper/scripts/phase1b_llm_score.py`（动态计算日期，不传参数）
-      - 分批并行调用 `openclaw agent --local`（每批20篇，最多5个并行）
+      - 分批并行调用 `openclaw agent --local`（每批20篇，最多3个并行）
       - 逐篇 LLM 评分，4维标准（Novelty/Significance/Soundness/Clarity）
       - 输出 `passed.json`（≥8分）+ `phase1b_evidence.json`（完整评分证据）
       
@@ -144,8 +209,11 @@ Cron/Mike 触发
       **输出**：`passed.json`（≥8分论文）+ `phase1b_evidence.json`（全部评分证据）
       
       **违规判定**：发现规则匹配代替 LLM → Phase1b 执行失败，必须重新执行
+      
+      **状态写入**：Phase1b完成后执行 `python3 /program/paper/scripts/pipeline_status.py phase1b`
     ↓
 【Phase2a】Main批量下载（exec执行）
+    - 启动时写入：`python3 /program/paper/scripts/pipeline_status.py phase2a`
     - Main读取passed.json，逐篇调用Firecrawl下载论文PDF全文
     - **执行方式**：`python3 /program/paper/scripts/phase2a_firecrawl.py {date}`
     - 保存到：{PAPER_DIR}/{arXiv_id}/paper.md
@@ -153,8 +221,18 @@ Cron/Mike 触发
     - 如有下载失败，记录error并继续
     ↓
 【Phase2b】流水线审阅（spawn并行）
+    - 启动时写入：`python3 /program/paper/scripts/pipeline_status.py phase2b`
     
     **核心原则**：Main Agent 是唯一的调度中心，通过 sessions_spawn 启动 subagent，不直接调用 LLM。
+    
+    **Pipeline状态写入**（每30分钟一次）：
+    ```bash
+    # 在每次向Mike汇报进度的同时，也更新全局状态
+    python3 /program/paper/scripts/pipeline_status.py heartbeat
+    python3 /program/paper/scripts/pipeline_status.py update --total 50 --completed X --failed Y --skipped Z
+    ```
+    
+    **Crash自动检测**：在调度循环的每次迭代开始时，检查距上次 heartbeat 是否 >15分钟，如果是则判定为崩溃并写入 `crash` 状态。
     
     **监管机制**：
     1. **started_at记录**：每次spawn时记录当前时间到status.json
@@ -171,14 +249,14 @@ Cron/Mike 触发
     **Main Agent 调度循环**（直到所有论文处理完）：
     
     ┌──────────────────────────────────────────────────────────────┐
-    │  流水线调度规则（最多5个Reviewer subagent并行）：              │
+    │  流水线调度规则（最多3个Reviewer subagent并行）：              │
     │                                                               │
     │  1. 【监控检查】检查疑似被kill的论文（>15分钟无更新）         │
     │     - 读取 status.json 中所有 in_progress 论文                │
     │     - 如果 当前时间 - started_at > 15分钟 → 标记为failed     │
     │     - 重新 spawn 该论文的对应步骤                              │
     │                                                               │
-    │  2. 补充 Reviewer（保持最多5个并行）                          │
+    │  2. 补充 Reviewer（保持最多3个并行）                          │
     │     - 读取 passed.json 中未处理的论文                         │
     │     - 对每篇论文 spawn 一个 Reviewer subagent                  │
     │     - **记录 started_at 到 status.json**                      │
@@ -208,7 +286,7 @@ Cron/Mike 触发
     
     ① **读取待处理队列**：从 `{BASE}/passed.json` 读取论文列表
     
-    ② **Spawn Reviewer（最多5个并行）**：
+    ② **Spawn Reviewer（最多3个并行）**：
        使用 `sessions_spawn` 启动 Reviewer subagent：
        
        ```json
@@ -246,7 +324,7 @@ Cron/Mike 触发
        python3 /program/paper/scripts/run_code_phase.py {date}
        ```
     
-    ⑥ **补充新 Reviewer**：保持5个并行，直到队列为空
+    ⑥ **补充新 Reviewer**：保持3个并行，直到队列为空
     
     **轮询间隔说明**：
     - Main Agent 发起 spawn 后，**必须等待 subagent 完成**
@@ -258,7 +336,7 @@ Cron/Mike 触发
     - V1/V2 由 **Main Agent exec** 调用 `/program/paper/scripts/verify_v1.py` / `/program/paper/scripts/verify_v2.py`，**不是独立的 verifier subagent**
     - subagent 只负责生成 JSON，Main Agent 负责验证和调度
 
-    ### V1失败处理（最多2次机会）
+    ### V1失败处理（最多2次机会，含429检测）
     ```
     Reviewer生成reviewer.json
          │
@@ -271,18 +349,31 @@ Cron/Mike 触发
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第1次失败 │ → respawn Reviewer（重试1次）
+    │ 检测是否 │
+    │ 429截断 │ → 是（JSON无效/截断）→ 指数退避重试（30s→60s→120s）
+    │ 格式错误 │ → 否 → 进入重试判断
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第2次失败 │ → Main Agent亲自接管，生成Part1-3 JSON写入reviewer.json
+    │ 第1次失败 │ → 退避30s后 respawn Reviewer
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第2次失败 │ → 退避60s后 respawn Reviewer
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第3次失败 │ → Main Agent亲自接管，生成Part1-3 JSON写入reviewer.json
     └────┬────┘
          │
          ▼
       进入Coach（无论成功与否继续）
     ```
 
-    ### V2失败处理（最多2次机会）
+    **429截断判定**：reviewer.json存在但JSON无效（json.JSONDecodeError），或文件大小<500字节
+    **退避策略**：30s → 60s → 120s（最多3次重试）
+
+    ### V2失败处理（最多2次机会，含429检测）
     ```
     Coach生成coach.json
          │
@@ -295,16 +386,29 @@ Cron/Mike 触发
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第1次失败 │ → 先修复JSON（引号/格式），再respawn Coach
+    │ 检测是否 │
+    │ 429截断 │ → 是（JSON无效/截断）→ 指数退避重试（30s→60s→120s）
+    │ 格式错误 │ → 否 → 先修复JSON引号/格式，再重试
     └────┬────┘
          │
     ┌────▼────┐
-    │ 第2次失败 │ → Main Agent亲自接管，生成Part4-5 JSON写入coach.json
+    │ 第1次失败 │ → 退避30s后 respawn Coach
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第2次失败 │ → 退避60s后 respawn Coach
+    └────┬────┘
+         │
+    ┌────▼────┐
+    │ 第3次失败 │ → Main Agent亲自接管，生成Part4-5 JSON写入coach.json
     └────┬────┘
          │
          ▼
       进入Code（无论成功与否继续）
     ```
+
+    **429截断判定**：coach.json存在但JSON无效（json.JSONDecodeError），或文件大小<500字节
+    **退避策略**：30s → 60s → 120s（最多3次重试）
 
     ### V3失败处理
     ```
@@ -544,6 +648,26 @@ python3 /program/paper/scripts/run_code_phase.py 2026-04-08
 - **PDF下载失败**：重试5次，仍失败则跳过该论文
 - **arXiv API 429/超时**：重试5次（30s/60s/120s/240s/480s指数退避）
 
+### Pipeline 状态收尾
+
+**正常完成**：`python3 /program/paper/scripts/pipeline_status.py complete`
+
+**Crash处理**：任何阶段抛出未捕获异常时，先执行：
+```bash
+python3 /program/paper/scripts/pipeline_status.py crash "<具体原因>"
+```
+然后再向上抛出。
+
+**Phase2b每次循环**（调度循环开始时）：
+```bash
+# 检查是否超过15分钟无心跳（疑似挂死）
+AGE=$(python3 /program/paper/scripts/pipeline_status.py heartbeat_age 2>/dev/null || echo 999)
+if [ "$AGE" -gt 900 ]; then
+    python3 /program/paper/scripts/pipeline_status.py crash "No heartbeat for ${AGE}s"
+    # 重新初始化状态，启动恢复流程
+fi
+```
+
 ## Mike 汇报格式（最终报告）
 
 ```
@@ -592,4 +716,4 @@ Coach跳过论文（<80分）：
 
 ---
 
-**状态**：V8.25（Code阶段完全固化=exec脚本，禁止subagent；预删除防残留；V3失败强制修复）
+**状态**：V9.0（状态外置化 + 并行度降到3 + 批量轮询）
