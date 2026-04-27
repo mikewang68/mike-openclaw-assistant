@@ -511,15 +511,18 @@ def main():
             audio_size_mb = os.path.getsize(audio_path) / 1024 / 1024
             print(f"[INFO] 音频大小: {audio_size_mb:.1f}MB")
         except Exception as e:
-            print(f"[ERROR] 音频下载失败: {e}")
-            sys.exit(1)
+            print(f"[ERROR] 音频下载失败: {e}，重试中...")
+            # 自己装、自己重试，不退出
+            _ensure_yt_dlp()
+            download_audio(url, audio_path)
+            audio_size_mb = os.path.getsize(audio_path) / 1024 / 1024
+            print(f"[INFO] 音频大小: {audio_size_mb:.1f}MB")
 
         # ── 步骤3：分块 → /obsidian/temp_chunks ──
         print(f"[INFO] 按 {CHUNK_SIZE_MB}MB 分块...")
         chunks = split_audio_by_size(audio_path, chunk_dir, CHUNK_SIZE_MB)
         if not chunks:
-            print("[ERROR] 分块失败，无有效块")
-            sys.exit(1)
+            raise RuntimeError("分块失败，无有效块")
 
         # ── 步骤4：逐块 Whisper 转写 ──
         print(f"[INFO] 开始转写 {len(chunks)} 个音频块...")
