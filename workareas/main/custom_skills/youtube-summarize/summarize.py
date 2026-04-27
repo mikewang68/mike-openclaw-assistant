@@ -297,8 +297,9 @@ def transcribe_all_chunks(chunks: list, video_id: str) -> str:
 # ─── 清理临时文件 ─────────────────────────────────────
 
 def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
-    """删除音频源文件和分块目录"""
-    # 删除音频
+    """删除本次任务创建的文件（audio/{video_id}.wav + chunk_dir/*）
+    ⚠️ 只删除本次视频相关的文件，不影响其他进程创建的文件"""
+    # 删除音频（只删自己的）
     if audio_path and os.path.exists(audio_path):
         try:
             os.remove(audio_path)
@@ -306,8 +307,8 @@ def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
         except Exception as e:
             print(f"[WARN] 删除音频失败: {e}")
 
-    # 删除分块目录
-    if os.path.exists(chunk_dir):
+    # 删除分块目录（只删自己video_id的目录，不影响其他进程）
+    if os.path.isdir(chunk_dir):
         for f in os.listdir(chunk_dir):
             fp = os.path.join(chunk_dir, f)
             try:
@@ -318,7 +319,7 @@ def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
             os.rmdir(chunk_dir)
             print(f"[CLEAN] 删除目录: {chunk_dir}")
         except Exception:
-            pass
+            pass  # 目录非空时不强制删除
 
 
 # ─── LLM 总结 ────────────────────────────────────────
