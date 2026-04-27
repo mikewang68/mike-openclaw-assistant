@@ -4,13 +4,14 @@ youtube-summarize — YouTube 视频总结 Skill
 
 工作流程：
   模式一（字幕）：YouTube字幕 → 直接LLM总结
-  模式二（无字幕）：下载音频(→/obsidian/audio) → 按10MB分块(→/obsidian/temp_chunks)
+  模式二（无字幕）：下载音频(→/obsidian/audio) → 按9MB分块(→/obsidian/temp_chunks)
                 → 逐块Whisper转写 → 合并文本 → LLM总结 → 保存文件 → 清理临时文件
 
 用法：
   python3 summarize.py <YouTube_URL> [--output DIR]
 """
 
+import shutil
 import sys
 import re
 import json
@@ -83,7 +84,7 @@ def call_llm(prompt: str, model: str = "MiniMax-M2.7", temperature: float = 0.3)
             url, data=json.dumps(payload).encode('utf-8'),
             headers=headers, method='POST'
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode())
             return result.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
     except Exception as e:
@@ -202,53 +203,88 @@ def download_audio(url: str, output_path: str) -> str:
 # ─── 按大小分块 ───────────────────────────────────────
 
 def split_audio_by_size(wav_path: str, chunk_dir: str, max_size_mb: int = CHUNK_SIZE_MB) -> list:
-    """按文件大小（MB）将 WAV 分割为多个块，返回每块的起始时间戳列表"""
+    """严格按9MB文件大小分割WAV，返回每块路径列表（每块<=9MB）"""
+    import shutil
     os.makedirs(chunk_dir, exist_ok=True)
-    max_size_bytes = max_size_mb * 1024 * 1024
+    max_size_bytes = max_size_mb * 1024 * 1024  # 9MB
 
-    # 获取音频总时长
+    # 获取音频总大小
+    total_size = os.path.getsize(wav_path)
+    total_secs = get_audio_duration(wav_path)
+    bytes_per_sec = total_size / total_secs if total_secs > 0 else 32000
+    chunk_duration_est = max_size_bytes / bytes_per_sec  # 估算每块时长
+
+    chunks = []
+    start_sec = 0.0
+    chunk_idx = 0
+
+    while start_sec < total_secs:
+        # 每块目标大小严格为9MB（最后一块可能更小）
+        remaining_bytes = total_size - int(start_sec * bytes_per_sec)
+        if remaining_bytes <= max_size_bytes:
+            # 最后一块：直接到末尾
+            chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
+            chunk_duration = total_secs - start_sec
+            subprocess.run([
+                FFMPEG, '-i', wav_path,
+                '-ss', str(start_sec), '-t', str(chunk_duration),
+                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                chunk_path, '-y'
+            ], capture_output=True)
+            actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
+            chunks.append({'index': chunk_idx, 'start': start_sec, 'end': total_secs,
+                          'path': chunk_path, 'size_mb': actual_size / 1024 / 1024})
+            print(f"  [{chunk_idx:02d}] {start_sec:.1f}s-{total_secs:.1f}s ({chunk_duration:.1f}s, {actual_size/1024/1024:.1f}MB) [最后一块]")
+            break
+
+        # 中间块：按9MB严格分割
+        chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
+        chunk_duration = chunk_duration_est
+        subprocess.run([
+            FFMPEG, '-i', wav_path,
+            '-ss', str(start_sec), '-t', str(chunk_duration),
+            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            chunk_path, '-y'
+        ], capture_output=True)
+
+        actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
+        actual_mb = actual_size / 1024 / 1024
+
+        # 如果实际大小超过9MB（估算不准），递归缩小重切
+        if actual_mb > max_size_mb + 0.5:
+            # 缩小10%后重切
+            os.remove(chunk_path)
+            chunk_duration = chunk_duration * 0.9
+            subprocess.run([
+                FFMPEG, '-i', wav_path,
+                '-ss', str(start_sec), '-t', str(chunk_duration),
+                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                chunk_path, '-y'
+            ], capture_output=True)
+            actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
+            actual_mb = actual_size / 1024 / 1024
+
+        end_sec = start_sec + chunk_duration
+        chunks.append({'index': chunk_idx, 'start': start_sec, 'end': end_sec,
+                      'path': chunk_path, 'size_mb': actual_mb})
+        print(f"  [{chunk_idx:02d}] {start_sec:.1f}s-{end_sec:.1f}s ({chunk_duration:.1f}s, {actual_mb:.1f}MB)")
+        start_sec = end_sec
+        chunk_idx += 1
+
+    print(f"  分块完成：共 {len(chunks)} 块，总计 {sum(c['size_mb'] for c in chunks):.1f}MB")
+    return chunks
+
+
+def get_audio_duration(wav_path: str) -> float:
+    """获取WAV音频总时长（秒）"""
     result = subprocess.run(
         ['/program/tools/ffmpeg', '-i', wav_path],
         capture_output=True, text=True
     )
     m = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', result.stderr)
-    if not m:
-        raise RuntimeError("无法获取音频时长")
-    total_secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-
-    # 估算每块时长：文件大小 / (采样率 * 通道数 * 字节深度) * 总时长
-    # 16kHz mono 16bit = 32000 bytes/s ≈ 0.032 MB/s
-    # 所以 max_size_bytes 对应的秒数 ≈ max_size_bytes / 32000
-    bytes_per_sec = 16000 * 1 * 2  # 16000Hz * 1ch * 2bytes
-    chunk_duration_sec = max_size_bytes / bytes_per_sec
-
-    chunks = []
-    start = 0.0
-    chunk_idx = 0
-    while start < total_secs:
-        chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
-        end = min(start + chunk_duration_sec, total_secs)
-        duration = end - start
-
-        print(f"  [{chunk_idx:02d}] {start:.1f}s-{end:.1f}s ({duration:.1f}s) → {chunk_path}",
-              flush=True)
-
-        subprocess.run([
-            FFMPEG, '-i', wav_path,
-            '-ss', str(start), '-t', str(duration),
-            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-            chunk_path, '-y'
-        ], capture_output=True)
-
-        if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1000:
-            chunks.append({'index': chunk_idx, 'start': start, 'end': end, 'path': chunk_path})
-        else:
-            print(f"  ⚠️ 块 {chunk_idx} 无效或过小，跳过")
-        start = end
-        chunk_idx += 1
-
-    print(f"  分块完成：共 {len(chunks)} 块")
-    return chunks
+    if m:
+        return int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3)) + int(m.group(4))/100
+    return 0.0
 
 
 # ─── Whisper 转写 ─────────────────────────────────────
