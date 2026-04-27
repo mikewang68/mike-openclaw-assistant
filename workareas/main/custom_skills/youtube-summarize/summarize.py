@@ -24,15 +24,80 @@ from datetime import datetime
 
 # ─── 常量 ─────────────────────────────────────────────
 FFMPEG         = "/program/tools/ffmpeg"
-YT_DLP         = "/home/node/yt-dlp"
 WHISPER_API    = "http://192.168.1.2:9000/v1/audio/transcriptions"
-WHISPER_MODEL  = "Systran/faster-whisper-tiny"   # 可选：tiny/base/small/large-v3
-WHISPER_TIMEOUT = 300                            # 单块超时（秒）
-CHUNK_SIZE_MB  = 9                              # 音频分块大小（MB）
+WHISPER_MODEL  = "Systran/faster-whisper-tiny"
+WHISPER_TIMEOUT = 300
+CHUNK_SIZE_MB  = 9
 AUDIO_DIR      = "/obsidian/audio"
 TEMP_DIR       = "/obsidian/temp_chunks"
 DEFAULT_OUTPUT = "/obsidian/01_Input/01_视频"
 LLM_API_KEY_FILE = "/home/node/.openclaw/agents/main/agent/auth-profiles.json"
+
+# ─── 懒加载工具函数（先用，没有再装） ──────────────────────────
+
+def _get_pip():
+    """返回 pip 路径，懒加载：先用，没有再装"""
+    pip_paths = [
+        "/home/node/.local/bin/pip",
+        "/home/node/.local/bin/pip3",
+        "/home/node/.local/bin/pip3.11",
+    ]
+    for p in pip_paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return [p, "--break-system-packages"]
+    # 没有 pip，先装 pip
+    print("[INFO] pip 未找到，正在安装...")
+    subprocess.run([sys.executable, "/tmp/get-pip.py", "--break-system-packages", "-q"],
+                   capture_output=True)
+    return ["/home/node/.local/bin/pip", "--break-system-packages"]
+
+
+def _ensure_yt_dlp():
+    """确保 yt-dlp 可用，没有则安装，找不到则报错（让用户知道）"""
+    yt_dlp_path = "/home/node/yt-dlp"
+    if os.path.isfile(yt_dlp_path) and os.access(yt_dlp_path, os.X_OK):
+        return yt_dlp_path
+    # 尝试在 PATH 中找
+    for candidate in ["/home/node/.local/bin/yt-dlp", "/usr/local/bin/yt-dlp"]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            # 软链接到标准位置
+            os.makedirs(os.path.dirname(yt_dlp_path), exist_ok=True)
+            if os.path.islink(yt_dlp_path):
+                os.unlink(yt_dlp_path)
+            os.symlink(candidate, yt_dlp_path)
+            return yt_dlp_path
+    # 真的没有，安装
+    print("[INFO] yt-dlp 未找到，正在安装...")
+    bin_dir = "/home/node/.local/bin"
+    os.makedirs(bin_dir, exist_ok=True)
+    dl_path = os.path.join(bin_dir, "yt-dlp")
+    subprocess.run([
+        "curl", "-sL",
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+        "-o", dl_path
+    ], timeout=30)
+    os.chmod(dl_path, 0o755)
+    os.makedirs(os.path.dirname(yt_dlp_path), exist_ok=True)
+    if os.path.islink(yt_dlp_path):
+        os.unlink(yt_dlp_path)
+    os.symlink(dl_path, yt_dlp_path)
+    return yt_dlp_path
+
+
+def _ensure_youtube_transcript_api():
+    """确保 youtube-transcript-api 可用，没有则安装"""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        return YouTubeTranscriptApi
+    except ImportError:
+        pass
+    # 没有，装
+    print("[INFO] youtube-transcript-api 未安装，正在安装...")
+    pip_cmd, pip_args = _get_pip()
+    subprocess.run([pip_cmd] + pip_args + ["install", "youtube-transcript-api", "-q"],
+                   capture_output=True)
+    from youtube_transcript_api import YouTubeTranscriptApi
+    return YouTubeTranscriptApi
 
 
 # ─── 工具函数 ─────────────────────────────────────────
@@ -95,9 +160,10 @@ def call_llm(prompt: str, model: str = "MiniMax-M2.7", temperature: float = 0.3)
 # ─── 视频元数据 ───────────────────────────────────────
 
 def get_video_metadata(url: str) -> dict:
+    yt_dlp = _ensure_yt_dlp()
     try:
         result = subprocess.run(
-            [YT_DLP, '--dump-json', '--no-download', url],
+            [yt_dlp, '--dump-json', '--no-download', url],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
@@ -120,11 +186,7 @@ def get_video_metadata(url: str) -> dict:
 # ─── 字幕获取（模式一） ─────────────────────────────────
 
 def get_transcript(video_id: str):
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError:
-        raise RuntimeError("youtube_transcript_api 未安装，请 pip install youtube-transcript-api")
-
+    YouTubeTranscriptApi = _ensure_youtube_transcript_api()
     api = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
 
@@ -162,11 +224,12 @@ def get_transcript(video_id: str):
 
 def download_audio(url: str, output_path: str) -> str:
     """下载音视频并转为 16kHz mono WAV，保存到 output_path"""
+    yt_dlp = _ensure_yt_dlp()
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     tmp_audio = output_path.replace('.wav', '.tmp')
 
     result = subprocess.run(
-        [YT_DLP, '-f', 'bestaudio/best',
+        [yt_dlp, '-f', 'bestaudio/best',
          '-o', tmp_audio + '.%(ext)s',
          '--no-playlist', '--no-post-overwrites',
          url],
@@ -218,7 +281,6 @@ def split_audio_by_size(wav_path: str, chunk_dir: str, max_size_mb: int = CHUNK_
         sampwidth = wf.getsampwidth()     # 2 bytes
         framerate = wf.getframerate()     # 16000 Hz
         nframes = wf.getnframes()         # 总帧数
-        # byte_rate = framerate * nchannels * sampwidth
         byte_rate = framerate * nchannels * sampwidth
         pcm_data = wf.readframes(nframes)  # 读取全部PCM数据
 
@@ -278,18 +340,6 @@ def split_audio_by_size(wav_path: str, chunk_dir: str, max_size_mb: int = CHUNK_
     return chunks
 
 
-def get_audio_duration(wav_path: str) -> float:
-    """获取WAV音频总时长（秒）"""
-    result = subprocess.run(
-        ['/program/tools/ffmpeg', '-i', wav_path],
-        capture_output=True, text=True
-    )
-    m = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', result.stderr)
-    if m:
-        return int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3)) + int(m.group(4))/100
-    return 0.0
-
-
 # ─── Whisper 转写 ─────────────────────────────────────
 
 def transcribe_chunk(chunk_path: str) -> str:
@@ -338,7 +388,6 @@ def transcribe_all_chunks(chunks: list, video_id: str) -> str:
 def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
     """删除本次任务创建的文件（audio/{video_id}.wav + chunk_dir/*）
     ⚠️ 只删除本次视频相关的文件，不影响其他进程创建的文件"""
-    # 删除音频（只删自己的）
     if audio_path and os.path.exists(audio_path):
         try:
             os.remove(audio_path)
@@ -346,7 +395,6 @@ def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
         except Exception as e:
             print(f"[WARN] 删除音频失败: {e}")
 
-    # 删除分块目录（只删自己video_id的目录，不影响其他进程）
     if os.path.isdir(chunk_dir):
         for f in os.listdir(chunk_dir):
             fp = os.path.join(chunk_dir, f)
@@ -358,7 +406,7 @@ def cleanup_audio_and_chunks(audio_path: str, chunk_dir: str, video_id: str):
             os.rmdir(chunk_dir)
             print(f"[CLEAN] 删除目录: {chunk_dir}")
         except Exception:
-            pass  # 目录非空时不强制删除
+            pass
 
 
 # ─── LLM 总结 ────────────────────────────────────────
@@ -416,7 +464,7 @@ def generate_summary(metadata: dict, transcript: str, url: str) -> str:
     return call_llm(prompt)
 
 
-# ─── 主流程 ───────────────────────────────────────────
+# ─── 主流程 ──────────────────────────────────────────
 
 def main():
     url = None
@@ -482,18 +530,17 @@ def main():
             f.write(full_text)
         print(f"[INFO] 转写完成，累计 {len(full_text)} 字")
 
-        # ── 步骤6（前置）：保存音频路径供清理用 ──
         mode = "whisper"
         lang = "zh"
 
-        # ── 步骤7：清理临时文件 ──
+        # ── 步骤5：清理临时文件 ──
         print("[INFO] 清理临时文件...")
         cleanup_audio_and_chunks(audio_path, chunk_dir, video_id)
         if transcript_file and os.path.exists(transcript_file):
             os.remove(transcript_file)
             print(f"[CLEAN] 删除 transcript: {transcript_file}")
 
-    # ── 步骤5：LLM 总结 ──
+    # ── 步骤6：LLM 总结 ──
     print("[INFO] 调用 LLM 生成总结...")
     summary = generate_summary(metadata, full_text, url)
 
@@ -501,7 +548,7 @@ def main():
         print("[WARN] LLM 总结失败")
         summary = f"# {metadata.get('title', '视频总结')}\n\n**LLM 总结生成失败。**\n\n原始文本：\n\n{full_text[:3000]}"
 
-    # ── 步骤6：保存文件 ──
+    # ── 步骤7：保存文件 ──
     date_str = datetime.now().strftime('%Y-%m-%d')
     safe_title = re.sub(r'[\\/:*?"<>|]', '_', metadata.get('title', 'untitled'))[:50]
     filename = f"{date_str}-youtube-{safe_title}.md"
