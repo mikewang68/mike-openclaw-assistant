@@ -2,6 +2,7 @@
 
 > 适用场景：YouTube 视频链接，自动抓字幕或转写后生成结构化总结
 > 依赖：`youtube-transcript-api`、`yt-dlp`、`ffmpeg`（/program/tools/ffmpeg）、Whisper（NAS 192.168.1.2:9000）
+> ⚠️ 有字幕视频优先使用 youtube-transcript-api（参考 ClawhHub youtube-summarize skill）
 
 ## 环境状态
 
@@ -32,14 +33,14 @@
 
 - **API**：`http://192.168.1.2:9000/v1/audio/transcriptions`
 - **模型**：`Systran/faster-whisper-tiny`（可选：tiny/base/small/large-v3）
-- **单块超时**：300 秒
+- **单块超时**：300 秒（首次模型加载约 85s）
 - **语言**：中文优先（`language=zh`）
 - **格式**：16kHz mono WAV
 
 ## 分块策略
 
-按文件大小分割（10MB/块），而非按时间分割，保证每块大小均匀。
-估算方法：16kHz mono 16bit ≈ 0.032 MB/s
+按文件大小分割（**9MB**/块），而非按时间分割，保证每块大小均匀。
+估算方法：16kHz mono 16bit ≈ 0.032 MB/s → 9MB ≈ 4.5分钟
 
 ## 输出
 
