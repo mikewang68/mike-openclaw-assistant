@@ -24,7 +24,7 @@ from datetime import datetime
 
 # ─── 常量 ─────────────────────────────────────────────
 FFMPEG         = "/program/tools/ffmpeg"
-YT_DLP         = "/home/node/.local/bin/yt-dlp"
+YT_DLP         = "/home/node/yt-dlp"
 WHISPER_API    = "http://192.168.1.2:9000/v1/audio/transcriptions"
 WHISPER_MODEL  = "Systran/faster-whisper-tiny"   # 可选：tiny/base/small/large-v3
 WHISPER_TIMEOUT = 300                            # 单块超时（秒）
@@ -203,72 +203,75 @@ def download_audio(url: str, output_path: str) -> str:
 # ─── 按大小分块 ───────────────────────────────────────
 
 def split_audio_by_size(wav_path: str, chunk_dir: str, max_size_mb: int = CHUNK_SIZE_MB) -> list:
-    """严格按9MB文件大小分割WAV，返回每块路径列表（每块<=9MB）"""
-    import shutil
+    """严格按9MB文件大小切割WAV音频，返回每块信息列表。
+
+    策略：读取WAV的PCM原始数据，按9MB等大小切分，每段追加标准44字节WAV头。
+    这样每块严格<=9MB，无时间估算误差。"""
+    import wave as _wave
+    import struct as _struct
     os.makedirs(chunk_dir, exist_ok=True)
     max_size_bytes = max_size_mb * 1024 * 1024  # 9MB
 
-    # 获取音频总大小
-    total_size = os.path.getsize(wav_path)
-    total_secs = get_audio_duration(wav_path)
-    bytes_per_sec = total_size / total_secs if total_secs > 0 else 32000
-    chunk_duration_est = max_size_bytes / bytes_per_sec  # 估算每块时长
+    # ── 读取WAV信息 ──
+    with _wave.open(wav_path, 'rb') as wf:
+        nchannels = wf.getnchannels()     # 1
+        sampwidth = wf.getsampwidth()     # 2 bytes
+        framerate = wf.getframerate()     # 16000 Hz
+        nframes = wf.getnframes()         # 总帧数
+        # byte_rate = framerate * nchannels * sampwidth
+        byte_rate = framerate * nchannels * sampwidth
+        pcm_data = wf.readframes(nframes)  # 读取全部PCM数据
+
+    total_pcm_size = len(pcm_data)  # 字节数
+    total_duration = total_pcm_size / byte_rate
+    print(f"  WAV: {nchannels}ch {sampwidth*8}bit {framerate}Hz, PCM={total_pcm_size/1024/1024:.1f}MB, 时长={total_duration:.1f}s")
+
+    # 构造标准44字节WAV头（固定参数：16bit mono 16000Hz）
+    def make_wav_header(data_size: int):
+        chunk_size = 36 + data_size
+        return (
+            b'RIFF' +
+            _struct.pack('<I', chunk_size) +
+            b'WAVE' +
+            b'fmt ' +
+            _struct.pack('<I', 16) +          # Subchunk1Size = 16 (PCM)
+            _struct.pack('<H', 1) +            # AudioFormat = 1 (PCM)
+            _struct.pack('<H', nchannels) +   # NumChannels
+            _struct.pack('<I', framerate) +  # SampleRate
+            _struct.pack('<I', byte_rate) +  # ByteRate
+            _struct.pack('<H', nchannels * sampwidth) +  # BlockAlign
+            _struct.pack('<H', sampwidth * 8) +  # BitsPerSample
+            b'data' +
+            _struct.pack('<I', data_size)     # Subchunk2Size
+        )
 
     chunks = []
-    start_sec = 0.0
+    offset = 0
     chunk_idx = 0
 
-    while start_sec < total_secs:
-        # 每块目标大小严格为9MB（最后一块可能更小）
-        remaining_bytes = total_size - int(start_sec * bytes_per_sec)
-        if remaining_bytes <= max_size_bytes:
-            # 最后一块：直接到末尾
-            chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
-            chunk_duration = total_secs - start_sec
-            subprocess.run([
-                FFMPEG, '-i', wav_path,
-                '-ss', str(start_sec), '-t', str(chunk_duration),
-                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                chunk_path, '-y'
-            ], capture_output=True)
-            actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
-            chunks.append({'index': chunk_idx, 'start': start_sec, 'end': total_secs,
-                          'path': chunk_path, 'size_mb': actual_size / 1024 / 1024})
-            print(f"  [{chunk_idx:02d}] {start_sec:.1f}s-{total_secs:.1f}s ({chunk_duration:.1f}s, {actual_size/1024/1024:.1f}MB) [最后一块]")
-            break
-
-        # 中间块：按9MB严格分割
+    while offset < total_pcm_size:
+        chunk_pcm_size = min(max_size_bytes, total_pcm_size - offset)
         chunk_path = f"{chunk_dir}/chunk_{chunk_idx:04d}.wav"
-        chunk_duration = chunk_duration_est
-        subprocess.run([
-            FFMPEG, '-i', wav_path,
-            '-ss', str(start_sec), '-t', str(chunk_duration),
-            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-            chunk_path, '-y'
-        ], capture_output=True)
 
-        actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
-        actual_mb = actual_size / 1024 / 1024
+        with open(chunk_path, 'wb') as f:
+            f.write(make_wav_header(chunk_pcm_size))
+            f.write(pcm_data[offset:offset + chunk_pcm_size])
 
-        # 如果实际大小超过9MB（估算不准），递归缩小重切
-        if actual_mb > max_size_mb + 0.5:
-            # 缩小10%后重切
-            os.remove(chunk_path)
-            chunk_duration = chunk_duration * 0.9
-            subprocess.run([
-                FFMPEG, '-i', wav_path,
-                '-ss', str(start_sec), '-t', str(chunk_duration),
-                '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                chunk_path, '-y'
-            ], capture_output=True)
-            actual_size = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
-            actual_mb = actual_size / 1024 / 1024
+        actual_mb = os.path.getsize(chunk_path) / 1024 / 1024
+        start_sec = offset / byte_rate
+        end_sec = (offset + chunk_pcm_size) / byte_rate
+        is_last = (offset + chunk_pcm_size >= total_pcm_size - 1)
+        tag = " [最后一块]" if is_last else ""
+        print(f"  [{chunk_idx:02d}] {start_sec:.1f}s-{end_sec:.1f}s ({chunk_pcm_size/1024/1024:.1f}MB → {actual_mb:.1f}MB){tag}")
 
-        end_sec = start_sec + chunk_duration
-        chunks.append({'index': chunk_idx, 'start': start_sec, 'end': end_sec,
-                      'path': chunk_path, 'size_mb': actual_mb})
-        print(f"  [{chunk_idx:02d}] {start_sec:.1f}s-{end_sec:.1f}s ({chunk_duration:.1f}s, {actual_mb:.1f}MB)")
-        start_sec = end_sec
+        chunks.append({
+            'index': chunk_idx,
+            'start': start_sec,
+            'end': end_sec,
+            'path': chunk_path,
+            'size_mb': actual_mb
+        })
+        offset += chunk_pcm_size
         chunk_idx += 1
 
     print(f"  分块完成：共 {len(chunks)} 块，总计 {sum(c['size_mb'] for c in chunks):.1f}MB")
